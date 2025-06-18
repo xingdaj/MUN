@@ -13,7 +13,9 @@
 #### References:
 
 ** Rezende D, Mohamed S. Variational inference with normalizing flows. International conference on machine learning 2015 Jun 1 (pp. 1530-1538). PMLR.
+
 ** Kobyzev I, Prince SJ, Brubaker MA. Normalizing flows: An introduction and review of current methods. IEEE transactions on pattern analysis and machine intelligence.  2020 May 7;43(11):3964-79.
+
 ** Zhao X, Curtis A, Zhang X. Bayesian seismic tomography using normalizing flows. Geophysical Journal International. 2022 Jan;228(1):213-39.
 
 ** Contact: xingdaj@mun.ca  or jiangxdmun@gmail.cn
