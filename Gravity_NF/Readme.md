@@ -151,6 +151,8 @@ We need to calculate the gradients when updating the weighting factors in flow f
 ![](Readme.assets/posterior_marginals_3params_0.1.png)
 
 <img src="Readme.assets/posterior_predictive_check_0.1.png" style="zoom:67%;" />
+## Summary
+Now, alomst the related five factors have the big influence on the final results. Just keep careful about the chosen parameters and try to test some of them to make your result better.  
 
 ## Conclusion
 
