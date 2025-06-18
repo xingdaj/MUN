@@ -19,6 +19,7 @@
 ** Zhao X, Curtis A, Zhang X. Bayesian seismic tomography using normalizing flows. Geophysical Journal International. 2022 Jan;228(1):213-39.
 
 ** Contact: xingdaj@mun.ca  or jiangxdmun@gmail.cn
+
 ** Date   : 13 Jun, 2025
 
 ## The Forward Formula for Gravity Anomaly
