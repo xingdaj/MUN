@@ -1,5 +1,5 @@
 #### Introduction
-* We have upload 5 files to infer the same posterior distribution problem -- One for forward code, and four for different posterior distribution solver //
+* We have upload 5 files to infer the same posterior distribution problem -- One for forward code, and four for different posterior distribution solver \\
 -- 'SEM' is for forward calculation
 -- 'MCMC'is for MCMC sampler with  Delayed Rejection Adaptive Metropolis (DRAM)  
 -- 'Affine_Coupling' is the coupling flows with affine function (Normalizing Flows)
