@@ -1,10 +1,10 @@
 #### Introduction
 * We have upload 5 files to infer the same posterior distribution problem -- One for forward code, and four for different posterior distribution solver:
-(1) -- 'SEM' is for forward calculation 
-* -- 'MCMC'is for MCMC sampler with  Delayed Rejection Adaptive Metropolis (DRAM)  
-* -- 'Affine_Coupling' is the coupling flows with affine function (Normalizing Flows)
-* -- 'RQS_Coupling' is the coupling flows with Rational-Quadratic Spline (RQS) function (Normalizing Flows)
-* -- 'RQS_autoregressive' is the auroregressive flows with Rational-Quadratic Spline (RQS) function (Normalizing Flows)
+* (1)  'SEM' is for forward calculation 
+* (2) 'MCMC'is for MCMC sampler with  Delayed Rejection Adaptive Metropolis (DRAM)  
+* (3) 'Affine_Coupling' is the coupling flows with affine function (Normalizing Flows)
+* (4) 'RQS_Coupling' is the coupling flows with Rational-Quadratic Spline (RQS) function (Normalizing Flows)
+* (5) 'RQS_autoregressive' is the auroregressive flows with Rational-Quadratic Spline (RQS) function (Normalizing Flows)
 
 #### Notice
 * For normalizing flows, you'll meet one problem when 'min_elbo_samples = 1' : the gradient will be extreme large. That will result in the failed optimization.
