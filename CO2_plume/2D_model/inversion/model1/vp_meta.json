@@ -1,0 +1,18 @@
+{
+  "source_array": "vp_smooth_pml.npy",
+  "crop_window": {
+    "xmin": 0.0,
+    "xmax": 6500.0,
+    "zmin": 1000.0,
+    "zmax": 3200.0
+  },
+  "xmin": 2.4736601007787726,
+  "xmax": 6497.526339899222,
+  "zmin": 1000.4634994206258,
+  "zmax": 3197.798377752028,
+  "nx": 1998,
+  "nz": 442,
+  "dx": 3.2524049473202012,
+  "dz": 4.98261877172655,
+  "array_layout": "cropped_array[nz, nx], row-0=zmin, row-end=zmax, col-0=xmin, col-end=xmax"
+}
