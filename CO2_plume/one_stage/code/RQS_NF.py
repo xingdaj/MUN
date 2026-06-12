@@ -103,7 +103,7 @@ SOURCE_POSITIONS = [
     [1300.0, 20.0],
     [1700.0, 20.0],
 ]
-SOURCE_FREQUENCY = float(os.environ.get("SOURCE_FREQUENCY", "35.0"))
+SOURCE_FREQUENCY = float(os.environ.get("SOURCE_FREQUENCY", "15.0"))
 SOURCE_AMPLITUDE = float(os.environ.get("SOURCE_AMPLITUDE", "1.0e4"))
 RECEIVER_XMIN = int(os.environ.get("RECEIVER_XMIN", "0"))
 RECEIVER_XMAX = int(os.environ.get("RECEIVER_XMAX", "2000"))
@@ -160,7 +160,7 @@ ZOOM_WINDOW = (
 # --- Optimization settings ---
 EPS64 = float(os.environ.get("EPS", "1e-30"))
 EPS = EPS64
-num_epochs = int(os.environ.get("NUM_EPOCHS", "100"))
+num_epochs = int(os.environ.get("NUM_EPOCHS", "150"))
 PRINT_EVERY = int(os.environ.get("PRINT_EVERY", "1"))
 PLOT_EVERY = int(os.environ.get("PLOT_EVERY", "5"))
 min_elbo_samples = int(os.environ.get("MIN_ELBO_SAMPLES", "4"))
