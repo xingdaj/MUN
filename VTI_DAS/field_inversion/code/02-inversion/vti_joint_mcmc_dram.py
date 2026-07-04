@@ -1,0 +1,3223 @@
+#!/usr/bin/env python3
+"""
+Single-file MCMC joint inversion for layered VTI parameters and source locations.
+
+Purpose
+-------
+This file condenses the MATLAB 02-inversion workflow into one Python script:
+    read input -> qx direct-wave forward modelling -> Gaussian MCMC proposal
+    -> likelihood/misfit -> accept/reject -> save chain/mean/best results.
+
+The forward modelling part follows the same DIRECT-wave qx principle as
+`vti_direct1.py`: for each source-receiver pair and each wave type qP/qSV/qSH,
+solve the horizontal ray parameter qx/px from the horizontal offset equation,
+then compute the layerwise travel time.
+
+Default input/output layout follows the MATLAB folder style:
+    input_dir  = ../01-initial
+        geo.dat      geometry
+        vel.dat      initial layered VTI model
+        nobs.dat     observed travel times
+        prior.dat    parameter bounds
+        prop.dat     proposal standard deviations
+    output_dir = ../03-output
+        mean.dat, best.dat, chain.npz, misfit.png
+
+Notes
+-----
+1. This version keeps the number of layers fixed, but updates only the
+   internal layer-interface depths by default. The first depth node dep[0]
+   and the last depth node dep[nlayer-1] are fixed. It inverts:
+       dep[1], dep[2], ..., dep[nlayer-2]
+   plus the five VTI parameters per layer:
+       alpha, beta, epsilon, gamma, delta
+   plus every source location sx, sz.
+2. To keep layer interfaces fixed, run with --no-invert-depths.
+3. The last layer is included in the five-parameter update by default. If your
+   MATLAB convention treats the bottom half-space as fixed, use --fix-last-layer.
+4. The code now uses component-wise DRAM: every iteration updates exactly one
+   scalar parameter, and a delayed-rejection smaller proposal is tried if the
+   first proposal is rejected. Proposal std values can be adapted from the chain.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import argparse
+import concurrent.futures as cf
+import math
+import os
+import time
+from typing import Dict, Tuple
+
+import numpy as np
+
+try:
+    import numba as _numba
+    _NUMBA_AVAILABLE = os.environ.get("VTI_USE_NUMBA", "1").lower() not in {"0", "false", "no"}
+except Exception:
+    _numba = None
+    _NUMBA_AVAILABLE = False
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:  # plotting is optional
+    plt = None
+
+WAVES = {1: "qP", 2: "qSV", 3: "qSH"}
+
+# Robust forward-model defaults and numerical safeguards copied from the validated vti_direct.py.
+DEFAULT_STOP = 1.0e-6  # fallback only; main() reads ../01-initial/output/control.dat when --qx-stop is not given
+DEFAULT_MAX_ITER = 20
+FORWARD_OFFSET_FAIL_FACTOR = 10.0
+FORWARD_OFFSET_FAIL_MIN = 1.0e-7
+ROUND_TOL = 1.0e-10
+MIN_POSITIVE = 1.0e-300
+CRITICAL_G0 = 1.0e-24
+QX_UPPER_LIMIT = 1.0e8
+BRACKET_EXPAND_ITERS = 80
+
+ROBUST_SOLVE_MIN_ITERS = 80
+
+
+# =============================================================================
+# Optional numba-accelerated qx kernel
+# =============================================================================
+
+if _NUMBA_AVAILABLE:
+    @_numba.njit(cache=False)
+    def _strict_sqrt_arg_numba(value: float, scale: float) -> tuple[bool, float]:
+        if not math.isfinite(value):
+            return False, 0.0
+        if not math.isfinite(scale) or scale < MIN_POSITIVE:
+            scale = MIN_POSITIVE
+        if value < -ROUND_TOL * scale:
+            return False, 0.0
+        if value < 0.0:
+            return True, 0.0
+        return True, value
+
+
+    @_numba.njit(cache=False)
+    def _g_derivatives_numba(ip: int, px: float, a: float, b: float, eps: float,
+                             delta: float, gamma: float) -> tuple[bool, float, float, float, float]:
+        if a <= 0.0 or b <= 0.0:
+            return False, 0.0, 0.0, 0.0, 0.0
+        if not (math.isfinite(px) and math.isfinite(a) and math.isfinite(b) and
+                math.isfinite(eps) and math.isfinite(delta) and math.isfinite(gamma)):
+            return False, 0.0, 0.0, 0.0, 0.0
+
+        if ip == 3:
+            A = 1.0 + 2.0 * gamma
+            if A <= 0.0:
+                return False, 0.0, 0.0, 0.0, 0.0
+            g0_raw = 1.0 / (b * b) - A * px * px
+            scale = max(abs(1.0 / (b * b)), abs(A * px * px), MIN_POSITIVE)
+            ok, g0 = _strict_sqrt_arg_numba(g0_raw, scale)
+            if not ok:
+                return False, 0.0, 0.0, 0.0, 0.0
+            return True, g0, -2.0 * A * px, -2.0 * A, 0.0
+
+        A = 1.0 + 2.0 * eps
+        if A <= 0.0:
+            return False, 0.0, 0.0, 0.0, 0.0
+
+        K = 1.0 + delta + (eps - delta) * a * a / (b * b)
+        B = 1.0 / (a * a) + 1.0 / (b * b) - 2.0 * K * px * px
+        B1 = -4.0 * K * px
+        B2 = -4.0 * K
+        B3 = 0.0
+
+        C = (A * px * px - 1.0 / (a * a)) * (px * px - 1.0 / (b * b))
+        C1 = 4.0 * A * px**3 - 2.0 * (A / (b * b) + 1.0 / (a * a)) * px
+        C2 = 12.0 * A * px * px - 2.0 * (A / (b * b) + 1.0 / (a * a))
+        C3 = 24.0 * A * px
+
+        U_raw = B * B - 4.0 * C
+        U_scale = max(B * B, abs(4.0 * C), MIN_POSITIVE)
+        ok, U = _strict_sqrt_arg_numba(U_raw, U_scale)
+        if not ok:
+            return False, 0.0, 0.0, 0.0, 0.0
+        r = math.sqrt(max(U, MIN_POSITIVE))
+
+        U1 = 2.0 * B * B1 - 4.0 * C1
+        U2 = 2.0 * (B1 * B1 + B * B2) - 4.0 * C2
+        U3 = 2.0 * (3.0 * B1 * B2 + B * B3) - 4.0 * C3
+
+        r1 = 0.5 * U1 / r
+        r2 = 0.5 * U2 / r - 0.25 * U1 * U1 / r**3
+        r3 = 0.5 * U3 / r - 0.75 * U1 * U2 / r**3 + 0.375 * U1**3 / r**5
+
+        sign = -1.0 if ip == 1 else 1.0
+        g0_raw = 0.5 * (B + sign * r)
+        g1 = 0.5 * (B1 + sign * r1)
+        g2 = 0.5 * (B2 + sign * r2)
+        g3 = 0.5 * (B3 + sign * r3)
+
+        g_scale = max(abs(B), abs(r), MIN_POSITIVE)
+        ok, g0 = _strict_sqrt_arg_numba(g0_raw, g_scale)
+        if not ok:
+            return False, 0.0, 0.0, 0.0, 0.0
+        if not (math.isfinite(g0) and math.isfinite(g1) and math.isfinite(g2) and math.isfinite(g3)):
+            return False, 0.0, 0.0, 0.0, 0.0
+        return True, g0, g1, g2, g3
+
+
+    @_numba.njit(cache=False)
+    def _q_to_p_numba(qx: float, pmin: float) -> tuple[bool, float]:
+        if not math.isfinite(qx):
+            return False, 0.0
+        if qx < 0.0:
+            qx = 0.0
+        px = qx * pmin / math.sqrt(1.0 + qx * qx)
+        return math.isfinite(px), px
+
+
+    @_numba.njit(cache=False)
+    def _offset_value_numba(ip: int, qx: float, H: float, Z: np.ndarray,
+                            alpha: np.ndarray, beta: np.ndarray, epsilon: np.ndarray,
+                            gamma: np.ndarray, delta: np.ndarray, pmin: float) -> tuple[bool, float, float, float]:
+        ok, px = _q_to_p_numba(qx, pmin)
+        if not ok:
+            return False, 0.0, 0.0, 0.0
+        Xcal = 0.0
+        nlayer = Z.shape[0]
+        for k in range(nlayer):
+            if Z[k] <= 0.0:
+                continue
+            ok_g, g0, g1, _, _ = _g_derivatives_numba(ip, px, alpha[k], beta[k], epsilon[k], delta[k], gamma[k])
+            if not ok_g:
+                return False, 0.0, 0.0, 0.0
+            root_g0 = math.sqrt(max(g0, MIN_POSITIVE))
+            G1 = 0.5 * g1 / root_g0
+            Xcal += -Z[k] * G1
+        f = Xcal - H
+        if not (math.isfinite(f) and math.isfinite(px) and math.isfinite(Xcal)):
+            return False, 0.0, 0.0, 0.0
+        return True, f, px, Xcal
+
+
+    @_numba.njit(cache=False)
+    def _offset_and_derivatives_numba(ip: int, qx: float, H: float, Z: np.ndarray,
+                                      alpha: np.ndarray, beta: np.ndarray, epsilon: np.ndarray,
+                                      gamma: np.ndarray, delta: np.ndarray, pmin: float) -> tuple[bool, float, float, float, float, float]:
+        ok, px = _q_to_p_numba(qx, pmin)
+        if not ok:
+            return False, 0.0, 0.0, 0.0, 0.0, 0.0
+        dpdq = pmin * (1.0 + qx * qx)**(-1.5)
+        d2pdq2 = -3.0 * qx * pmin * (1.0 + qx * qx)**(-2.5)
+        Xcal = 0.0
+        sum_z_g2 = 0.0
+        sum_z_term = 0.0
+        nlayer = Z.shape[0]
+        for k in range(nlayer):
+            if Z[k] <= 0.0:
+                continue
+            ok_g, g0, g1, g2, g3 = _g_derivatives_numba(ip, px, alpha[k], beta[k], epsilon[k], delta[k], gamma[k])
+            if not ok_g or g0 <= CRITICAL_G0:
+                return False, 0.0, 0.0, 0.0, 0.0, 0.0
+            root_g0 = math.sqrt(g0)
+            root2 = root_g0 * root_g0
+            root3 = root2 * root_g0
+            root5 = root3 * root2
+            G1 = 0.5 * g1 / root_g0
+            G2 = -0.25 * g1 * g1 / root3 + 0.5 * g2 / root_g0
+            G3 = 0.375 * g1**3 / root5 - 0.75 * g1 * g2 / root3 + 0.5 * g3 / root_g0
+            term = G3 * dpdq * dpdq + G2 * d2pdq2
+            if not (math.isfinite(G1) and math.isfinite(G2) and math.isfinite(G3) and math.isfinite(term)):
+                return False, 0.0, 0.0, 0.0, 0.0, 0.0
+            Xcal += -Z[k] * G1
+            sum_z_g2 += Z[k] * G2
+            sum_z_term += Z[k] * term
+        f = Xcal - H
+        dfdq = -sum_z_g2 * dpdq
+        d2fdq2 = -sum_z_term
+        if not (math.isfinite(f) and math.isfinite(dfdq) and math.isfinite(d2fdq2) and math.isfinite(px) and math.isfinite(Xcal)):
+            return False, 0.0, 0.0, 0.0, 0.0, 0.0
+        return True, f, dfdq, d2fdq2, px, Xcal
+
+
+    @_numba.njit(cache=False)
+    def _solve_qx_numba(ip: int, H: float, Z: np.ndarray,
+                        alpha: np.ndarray, beta: np.ndarray, epsilon: np.ndarray,
+                        gamma: np.ndarray, delta: np.ndarray, pmax: np.ndarray,
+                        stop: float, max_iter: int, qx_init: float) -> tuple[bool, float, float, float, int, bool]:
+        nlayer = Z.shape[0]
+        any_active = False
+        pmin = 1.0e300
+        for k in range(nlayer):
+            if Z[k] > 0.0:
+                any_active = True
+                if not math.isfinite(pmax[k]) or pmax[k] <= 0.0:
+                    return False, 0.0, 0.0, 0.0, 0, False
+                if pmax[k] < pmin:
+                    pmin = pmax[k]
+        if not any_active:
+            return False, 0.0, 0.0, 0.0, 0, False
+        if H == 0.0:
+            return True, 0.0, 0.0, 0.0, 0, True
+        if not math.isfinite(pmin) or pmin <= 0.0:
+            return False, 0.0, 0.0, 0.0, 0, False
+
+        q_low = 0.0
+        ok, f_low, px_low, x_low = _offset_value_numba(ip, q_low, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+        if not ok:
+            return False, 0.0, 0.0, 0.0, 0, False
+        if abs(f_low) <= stop:
+            return True, 0.0, px_low, f_low, 0, True
+
+        q_high = 1.0
+        f_high = math.nan
+        for _ in range(BRACKET_EXPAND_ITERS):
+            ok_high, f_high_tmp, px_high, x_high = _offset_value_numba(ip, q_high, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+            if not ok_high:
+                q_high *= 0.5
+                continue
+            f_high = f_high_tmp
+            if f_high >= 0.0:
+                break
+            q_high *= 2.0
+            if q_high > QX_UPPER_LIMIT:
+                break
+        if not math.isfinite(f_high) or f_high < 0.0:
+            return False, 0.0, 0.0, 0.0, 0, False
+
+        if math.isfinite(qx_init) and qx_init > q_low and qx_init < q_high:
+            qx = qx_init
+        else:
+            qx = 1.0
+            if qx <= q_low:
+                qx = 0.5 * (q_low + q_high)
+            if qx >= q_high:
+                qx = 0.5 * (q_low + q_high)
+
+        it_done = 0
+        converged = False
+        max_internal_iter = max_iter
+        if max_internal_iter < ROBUST_SOLVE_MIN_ITERS:
+            max_internal_iter = ROBUST_SOLVE_MIN_ITERS
+
+        for it in range(1, max_internal_iter + 1):
+            derivative_ok, f, df, d2f, px, Xcal = _offset_and_derivatives_numba(ip, qx, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+            if not derivative_ok:
+                ok_val, f, px, Xcal = _offset_value_numba(ip, qx, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+                if not ok_val:
+                    return False, 0.0, 0.0, 0.0, it, False
+                df = math.nan
+                d2f = math.nan
+
+            it_done = it
+            if abs(f) <= stop:
+                converged = True
+                break
+
+            if f < 0.0:
+                q_low = qx
+                f_low = f
+            else:
+                q_high = qx
+                f_high = f
+
+            best_q = math.nan
+            best_f = math.nan
+            best_err = 1.0e300
+
+            if derivative_ok:
+                disc = df * df - 2.0 * d2f * f
+                if abs(d2f) > 1.0e-30 and math.isfinite(disc) and disc >= 0.0:
+                    root = math.sqrt(disc)
+                    qtrial = qx + (-df + root) / d2f
+                    if math.isfinite(qtrial) and qtrial > q_low and qtrial < q_high:
+                        ok_trial, ftrial, _, _ = _offset_value_numba(ip, qtrial, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+                        if ok_trial:
+                            err = abs(ftrial)
+                            if err < best_err:
+                                best_q = qtrial
+                                best_f = ftrial
+                                best_err = err
+                    qtrial = qx + (-df - root) / d2f
+                    if math.isfinite(qtrial) and qtrial > q_low and qtrial < q_high:
+                        ok_trial, ftrial, _, _ = _offset_value_numba(ip, qtrial, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+                        if ok_trial:
+                            err = abs(ftrial)
+                            if err < best_err:
+                                best_q = qtrial
+                                best_f = ftrial
+                                best_err = err
+                if abs(df) > 1.0e-30 and math.isfinite(df):
+                    qtrial = qx - f / df
+                    if math.isfinite(qtrial) and qtrial > q_low and qtrial < q_high:
+                        ok_trial, ftrial, _, _ = _offset_value_numba(ip, qtrial, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+                        if ok_trial:
+                            err = abs(ftrial)
+                            if err < best_err:
+                                best_q = qtrial
+                                best_f = ftrial
+                                best_err = err
+
+            qtrial = 0.5 * (q_low + q_high)
+            ok_trial, ftrial, _, _ = _offset_value_numba(ip, qtrial, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+            if not ok_trial:
+                return False, 0.0, 0.0, 0.0, it, False
+            err = abs(ftrial)
+            if (not math.isfinite(best_q)) or err < best_err:
+                best_q = qtrial
+                best_f = ftrial
+                best_err = err
+
+            qx = best_q
+
+        ok_final, f_final, px_final, Xcal_final = _offset_value_numba(ip, qx, H, Z, alpha, beta, epsilon, gamma, delta, pmin)
+        if not ok_final:
+            return False, 0.0, 0.0, 0.0, it_done, converged
+        if abs(f_final) <= stop:
+            converged = True
+        if it_done > max_internal_iter:
+            it_done = max_internal_iter
+        return True, qx, px_final, f_final, it_done, converged
+
+
+    @_numba.njit(cache=False)
+    def _travel_time_numba(ip: int, px: float, Z: np.ndarray,
+                           alpha: np.ndarray, beta: np.ndarray, epsilon: np.ndarray,
+                           gamma: np.ndarray, delta: np.ndarray) -> tuple[bool, float]:
+        total = 0.0
+        nlayer = Z.shape[0]
+        for k in range(nlayer):
+            if Z[k] <= 0.0:
+                continue
+            ok_g, g0, g1, _, _ = _g_derivatives_numba(ip, px, alpha[k], beta[k], epsilon[k], delta[k], gamma[k])
+            if not ok_g:
+                return False, 0.0
+            pz = math.sqrt(max(g0, MIN_POSITIVE))
+            dS_dpx = -g1
+            dS_dpz = 2.0 * pz
+            denom = px * dS_dpx + pz * dS_dpz
+            if not math.isfinite(denom) or abs(denom) < 1.0e-30:
+                return False, 0.0
+            Vz = dS_dpz / denom
+            if not math.isfinite(Vz) or Vz <= 0.0:
+                return False, 0.0
+            total += Z[k] / Vz
+        if not math.isfinite(total) or total < 0.0:
+            return False, 0.0
+        return True, total
+
+else:
+    _strict_sqrt_arg_numba = None
+    _g_derivatives_numba = None
+    _solve_qx_numba = None
+    _travel_time_numba = None
+
+
+# =============================================================================
+# Data containers
+# =============================================================================
+
+@dataclass
+class Geometry:
+    sx: np.ndarray
+    sz: np.ndarray
+    rx: np.ndarray
+    rz: np.ndarray
+
+    @property
+    def ns(self) -> int:
+        return int(len(self.sx))
+
+    @property
+    def nr(self) -> int:
+        return int(len(self.rx))
+
+
+@dataclass
+class VTIModel:
+    dep: np.ndarray
+    alpha: np.ndarray
+    beta: np.ndarray
+    epsilon: np.ndarray
+    gamma: np.ndarray
+    delta: np.ndarray
+
+    @property
+    def nlayer(self) -> int:
+        return int(len(self.dep))
+
+
+@dataclass
+class ObsData:
+    sigma: float
+    tp: np.ndarray
+    tsv: np.ndarray
+    tsh: np.ndarray
+    # Geometry copied from each nobs.dat row. These are used only for
+    # consistency checks against geo.dat; forward modelling still uses geo.dat.
+    sx_row: np.ndarray | None = None
+    sz_row: np.ndarray | None = None
+    rx_row: np.ndarray | None = None
+    rz_row: np.ndarray | None = None
+
+
+@dataclass
+class Prior:
+    nmin: int = 1
+    nmax: int = 999
+    depmin: float = -np.inf
+    depmax: float = np.inf
+    ddep: float = np.inf
+    amin: float = 0.0
+    amax: float = np.inf
+    da: float = np.inf
+    bmin: float = 0.0
+    bmax: float = np.inf
+    db: float = np.inf
+    emin: float = -np.inf
+    emax: float = np.inf
+    de: float = np.inf
+    gmin: float = -np.inf
+    gmax: float = np.inf
+    dg: float = np.inf
+    dmin: float = -np.inf
+    dmax: float = np.inf
+    dd: float = np.inf
+    hmin: float = -np.inf
+    hmax: float = np.inf
+    dh: float = np.inf
+    zmin: float = -np.inf
+    zmax: float = np.inf
+    dz: float = np.inf
+    tmin: float = 1e-12
+    tmax: float = np.inf
+    dt: float = np.inf
+
+
+
+
+@dataclass
+class LikelihoodConfig:
+    """Precomputed likelihood ingredients for the selected data objective.
+
+    Convention used by default:
+    sigma_abs is the standard deviation of the original absolute arrival-time
+    noise.  If the objective is differential arrivals, the differential
+    covariance is C_d = sigma_abs^2 A A^T.
+
+    For efficiency, the transformed observed data and inverse covariance are
+    precomputed once before MCMC starts.
+    """
+    objective_type: str
+    use_waves: str
+    sigma_abs: float
+    sigma_mode: str = "absolute"
+    waves: tuple[str, ...] = ()
+    diff_matrix: np.ndarray | None = None
+    cov_inv: np.ndarray | None = None
+    chol: np.ndarray | None = None
+    obs_d: np.ndarray | None = None
+    ndata_per_source: int = 0
+@dataclass
+class Proposal:
+    obstd: float = 0.0
+    depstd: float = 0.0
+    astd: float = 1.0
+    bstd: float = 1.0
+    estd: float = 0.01
+    gstd: float = 0.01
+    dstd: float = 0.01
+    hstd: float = 1.0
+    zstd: float = 1.0
+
+
+# =============================================================================
+# Small input readers: text headers are ignored; only numeric tokens are used.
+# =============================================================================
+
+def float_tokens(path: str | Path) -> list[float]:
+    vals: list[float] = []
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    for token in text.replace(",", " ").split():
+        try:
+            vals.append(float(token))
+        except ValueError:
+            pass
+    return vals
+
+
+def read_forward_control(path: str | Path) -> tuple[float, int]:
+    """Read qx stop tolerance and max iteration from control.dat.
+
+    control.dat numeric convention used by direct.py/vti_direct.py:
+        value[0] = stop criterion
+        value[1] = maximum number of qx iterations
+
+    Text headers are ignored by float_tokens().
+    """
+    vals = float_tokens(path)
+    if len(vals) < 2:
+        raise ValueError(f"Cannot read qx stop/max_iter from {path}")
+    stop = float(vals[0])
+    max_iter = int(vals[1])
+    if not math.isfinite(stop) or stop <= 0.0:
+        raise ValueError(f"Invalid qx stop in {path}: {stop!r}")
+    if max_iter <= 0:
+        raise ValueError(f"Invalid qx max_iter in {path}: {max_iter!r}")
+    return stop, max_iter
+
+
+def resolve_qx_settings(qx_stop_arg: float | None, qx_max_iter_arg: int | None) -> tuple[float, int]:
+    """Resolve MCMC qx solver settings.
+
+    Important: shell_simple.py calls vti_joint_mcmc_dram.py without command-line
+    arguments.  The old code therefore used DEFAULT_STOP=1e-8 even when
+    01-initial/output/control.dat had been changed to 1e-6.  This function makes
+    MCMC read the same control.dat used by vti_direct.py unless the user
+    explicitly provides --qx-stop/--qx-max-iter.
+    """
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir.parent / "01-initial" / "output" / "control.dat",
+        Path("../01-initial/output/control.dat"),
+        Path("../01-initial/control.dat"),
+    ]
+
+    control_stop = None
+    control_max_iter = None
+    control_path = None
+    for cand in candidates:
+        try:
+            if cand.exists():
+                control_stop, control_max_iter = read_forward_control(cand)
+                control_path = cand
+                break
+        except Exception as exc:
+            print(f"[CONTROL][WARN] failed to read {cand}: {type(exc).__name__}: {exc}", flush=True)
+
+    stop = float(qx_stop_arg) if qx_stop_arg is not None else (
+        float(control_stop) if control_stop is not None else float(DEFAULT_STOP)
+    )
+    max_iter = int(qx_max_iter_arg) if qx_max_iter_arg is not None else (
+        int(control_max_iter) if control_max_iter is not None else int(DEFAULT_MAX_ITER)
+    )
+
+    if control_path is not None:
+        print(
+            f"[CONTROL] using qx_stop={stop:.12g}, qx_max_iter={max_iter} "
+            f"(control.dat={control_path})",
+            flush=True,
+        )
+    else:
+        print(
+            f"[CONTROL][WARN] control.dat not found; using qx_stop={stop:.12g}, "
+            f"qx_max_iter={max_iter}",
+            flush=True,
+        )
+    return stop, max_iter
+
+
+def _numeric_values_from_line(line: str) -> list[float]:
+    vals: list[float] = []
+    for tok in line.replace(",", " ").split():
+        try:
+            vals.append(float(tok))
+        except ValueError:
+            pass
+    return vals
+
+
+def read_geometry(path: str | Path) -> Geometry:
+    """Read full geo.dat or receiver-only geometry.dat.
+
+    Full geo.dat after grid search contains source coordinates.  The field
+    geometry.dat used before grid search intentionally contains only the event
+    count and receiver geometry, with rows receiver_id, rx, rz.  In that case
+    sx/sz are filled with NaN so diagnostic plots can omit initial sources.
+    """
+    path = Path(path)
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+
+    state = None
+    ns = None
+    nr = None
+    sx_rows: list[tuple[float, float]] = []
+    rx_rows: list[tuple[float, float]] = []
+    saw_labeled_section = False
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if "src" in low or "number of events" in low:
+            state = "src"
+            saw_labeled_section = True
+            continue
+        if "rev" in low or ("receiver" in low and "event" not in low):
+            state = "rev"
+            saw_labeled_section = True
+            continue
+
+        vals = _numeric_values_from_line(line)
+        if not vals:
+            continue
+        if state == "src":
+            if ns is None:
+                ns = int(vals[0])
+            elif len(vals) >= 2:
+                sx_rows.append((float(vals[0]), float(vals[1])))
+        elif state == "rev":
+            if nr is None:
+                nr = int(vals[0])
+            elif len(vals) >= 3:
+                # receiver_id rx rz
+                rx_rows.append((float(vals[-2]), float(vals[-1])))
+            elif len(vals) >= 2:
+                # rx rz
+                rx_rows.append((float(vals[0]), float(vals[1])))
+
+    if saw_labeled_section and ns is not None and nr is not None:
+        if len(rx_rows) != nr:
+            raise ValueError(f"Geometry file {path} says nr={nr}, but {len(rx_rows)} receiver rows were read")
+        sx = np.full(ns, np.nan, dtype=float)
+        sz = np.full(ns, np.nan, dtype=float)
+        if len(sx_rows) == ns:
+            sx[:] = [v[0] for v in sx_rows]
+            sz[:] = [v[1] for v in sx_rows]
+        rx = np.asarray([v[0] for v in rx_rows], dtype=float)
+        rz = np.asarray([v[1] for v in rx_rows], dtype=float)
+        return Geometry(sx=sx, sz=sz, rx=rx, rz=rz)
+
+    # Fallback for old compact numeric files without labels.
+    vals = float_tokens(path)
+    if len(vals) < 2:
+        raise ValueError(f"Cannot read geometry from {path}")
+    i = 0
+    ns = int(vals[i]); i += 1
+    sx = np.zeros(ns); sz = np.zeros(ns)
+    for k in range(ns):
+        sx[k] = vals[i]; sz[k] = vals[i + 1]; i += 2
+    nr = int(vals[i]); i += 1
+    rx = np.zeros(nr); rz = np.zeros(nr)
+    for k in range(nr):
+        rx[k] = vals[i]; rz[k] = vals[i + 1]; i += 2
+    return Geometry(sx=sx, sz=sz, rx=rx, rz=rz)
+
+
+def read_model(path: str | Path) -> VTIModel:
+    vals = float_tokens(path)
+    if len(vals) < 7:
+        raise ValueError(f"Cannot read VTI model from {path}")
+    nlayer = int(vals[0])
+    arr = np.asarray(vals[1:1 + 6 * nlayer], dtype=float).reshape(nlayer, 6)
+    return VTIModel(
+        dep=arr[:, 0].copy(),
+        alpha=arr[:, 1].copy(),
+        beta=arr[:, 2].copy(),
+        epsilon=arr[:, 3].copy(),
+        gamma=arr[:, 4].copy(),
+        delta=arr[:, 5].copy(),
+    )
+
+
+def read_observed(path: str | Path) -> ObsData:
+    """Read observed travel times from nobs.dat.
+
+    Two numeric layouts are supported.
+
+    New compact field layout, used by this workflow:
+        sigma
+        ns nr
+        event_id receiver_id rx rz tp
+        ... repeated ns*nr rows ...
+
+    Legacy synthetic layout:
+        sigma
+        ns nr
+        sx sz rx rz tp tsv tsh
+        ... repeated ns*nr rows ...
+
+    The compact field layout intentionally contains no source coordinates,
+    because source positions are unknown before grid search.
+    """
+    vals = float_tokens(path)
+    if len(vals) < 3:
+        raise ValueError(f"Cannot read observed data from {path}")
+    i = 0
+    sigma = float(vals[i]); i += 1
+    ns = int(vals[i]); nr = int(vals[i + 1]); i += 2
+    nrow = ns * nr
+    remaining = len(vals) - i
+
+    tp = np.zeros((ns, nr)); tsv = np.zeros((ns, nr)); tsh = np.zeros((ns, nr))
+    sx_row = None; sz_row = None
+    rx_row = np.zeros((ns, nr)); rz_row = np.zeros((ns, nr))
+
+    if remaining >= 5 * nrow and remaining < 7 * nrow:
+        # Compact field format: event_id receiver_id rx rz tp.
+        for isrc in range(ns):
+            for ir in range(nr):
+                _event_id = vals[i]
+                _receiver_id = vals[i + 1]
+                rx_row[isrc, ir] = vals[i + 2]
+                rz_row[isrc, ir] = vals[i + 3]
+                tp[isrc, ir] = vals[i + 4]
+                i += 5
+    elif remaining >= 7 * nrow:
+        # Legacy format: sx sz rx rz tp tsv tsh.
+        sx_row = np.zeros((ns, nr)); sz_row = np.zeros((ns, nr))
+        for isrc in range(ns):
+            for ir in range(nr):
+                sx_row[isrc, ir] = vals[i]
+                sz_row[isrc, ir] = vals[i + 1]
+                rx_row[isrc, ir] = vals[i + 2]
+                rz_row[isrc, ir] = vals[i + 3]
+                tp[isrc, ir] = vals[i + 4]
+                tsv[isrc, ir] = vals[i + 5]
+                tsh[isrc, ir] = vals[i + 6]
+                i += 7
+    else:
+        raise ValueError(
+            f"Observed file {path} is incomplete or has an unsupported format: "
+            f"ns={ns}, nr={nr}, remaining numeric values={remaining}. "
+            f"Expected either {5*nrow} compact-field values or {7*nrow} legacy values."
+        )
+
+    return ObsData(
+        sigma=sigma, tp=tp, tsv=tsv, tsh=tsh,
+        sx_row=sx_row, sz_row=sz_row, rx_row=rx_row, rz_row=rz_row,
+    )
+
+
+def _maxdiff_message(name: str, got: np.ndarray, expected: np.ndarray) -> tuple[float, str]:
+    """Return max absolute difference and a readable location message."""
+    diff = np.abs(got - expected)
+    finite_diff = np.where(np.isfinite(diff), diff, np.inf)
+    flat = int(np.argmax(finite_diff))
+    loc = np.unravel_index(flat, diff.shape)
+    max_diff = float(finite_diff[loc])
+    return max_diff, (
+        f"{name}: max_diff={max_diff:.12g} at source={loc[0]}, receiver={loc[1]}, "
+        f"nobs={got[loc]:.12g}, geo.dat={expected[loc]:.12g}"
+    )
+
+
+def validate_observed_geometry(geo: Geometry, obs: ObsData, tol: float = 1e-6,
+                               check_sources: bool = False) -> None:
+    """Validate receiver geometry embedded in nobs.dat against geo.dat.
+
+    Field nobs.dat intentionally does not store source coordinates, so source
+    checks are skipped unless legacy sx/sz columns are present.
+    """
+    if obs.tp.shape != (geo.ns, geo.nr):
+        raise ValueError(
+            f"Observed data shape {obs.tp.shape} does not match geo.dat geometry "
+            f"(ns={geo.ns}, nr={geo.nr})"
+        )
+    if obs.rx_row is None or obs.rz_row is None:
+        raise ValueError("nobs.dat receiver geometry columns were not loaded; cannot validate observation geometry")
+
+    tol = float(tol)
+    if tol < 0.0 or not math.isfinite(tol):
+        raise ValueError(f"Invalid geometry tolerance: {tol!r}")
+
+    exp_rx = np.repeat(geo.rx[None, :], geo.ns, axis=0)
+    exp_rz = np.repeat(geo.rz[None, :], geo.ns, axis=0)
+    receiver_checks = [("rx", obs.rx_row, exp_rx), ("rz", obs.rz_row, exp_rz)]
+
+    bad_messages = []
+    for name, got, expected in receiver_checks:
+        max_diff, msg = _maxdiff_message(name, got, expected)
+        if not np.all(np.isfinite(got)) or max_diff > tol:
+            bad_messages.append(msg)
+    if bad_messages:
+        raise ValueError(
+            "Receiver geometry mismatch between nobs.dat and geo.dat.\n"
+            + "\n".join(bad_messages)
+            + "\nUse the correct nobs.dat/geo.dat pair, or increase --geometry-tol only for harmless rounding differences."
+        )
+
+    if obs.sx_row is not None and obs.sz_row is not None:
+        for name, arr in [("sx", obs.sx_row), ("sz", obs.sz_row)]:
+            spread = np.nanmax(arr, axis=1) - np.nanmin(arr, axis=1)
+            if not np.all(np.isfinite(arr)) or np.any(spread > tol):
+                isrc = int(np.nanargmax(spread))
+                raise ValueError(
+                    f"nobs.dat source column {name} is not constant across receivers for source {isrc}: "
+                    f"spread={spread[isrc]:.12g}. Check nobs.dat row ordering/format."
+                )
+
+        if check_sources:
+            exp_sx = np.repeat(geo.sx[:, None], geo.nr, axis=1)
+            exp_sz = np.repeat(geo.sz[:, None], geo.nr, axis=1)
+            source_checks = [("sx", obs.sx_row, exp_sx), ("sz", obs.sz_row, exp_sz)]
+            source_bad = []
+            for name, got, expected in source_checks:
+                max_diff, msg = _maxdiff_message(name, got, expected)
+                if not np.all(np.isfinite(got)) or max_diff > tol:
+                    source_bad.append(msg)
+            if source_bad:
+                raise ValueError(
+                    "Source geometry mismatch between nobs.dat and geo.dat.\n"
+                    + "\n".join(source_bad)
+                    + "\nThis is expected if geo.dat contains initial source guesses while nobs.dat contains true synthetic source locations. "
+                    + "In that case, do not use --check-nobs-source-geometry."
+                )
+        else:
+            obs_sx = obs.sx_row[:, 0]
+            obs_sz = obs.sz_row[:, 0]
+            max_sx = float(np.max(np.abs(obs_sx - geo.sx)))
+            max_sz = float(np.max(np.abs(obs_sz - geo.sz)))
+            if max(max_sx, max_sz) > tol:
+                print(
+                    f"[CHECK] nobs.dat source coordinates differ from geo.dat initial source coordinates "
+                    f"(max |dsx|={max_sx:.6g}, max |dsz|={max_sz:.6g}); this is OK for source-location inversion.",
+                    flush=True,
+                )
+    elif check_sources:
+        print("[CHECK][WARN] --check-nobs-source-geometry ignored because compact field nobs.dat has no source columns", flush=True)
+
+    print(f"[CHECK] nobs.dat receiver geometry matches geo.dat within tolerance {tol:g}", flush=True)
+
+
+def check_receiver_order_for_differences(geo: Geometry, objective_type: str) -> None:
+    """Warn if adjacent station-pair differences may not follow physical cable order."""
+    if objective_type.lower() != "diff-p-adjacent":
+        return
+    dx = np.diff(np.asarray(geo.rx, dtype=float))
+    if dx.size == 0:
+        return
+    if np.all(dx > 0.0) or np.all(dx < 0.0):
+        print(
+            f"[CHECK] adjacent station pairs follow geo.dat receiver order; "
+            f"rx is monotonic, dx range=({np.min(np.abs(dx)):.6g}, {np.max(np.abs(dx)):.6g})",
+            flush=True,
+        )
+    else:
+        print(
+            "[WARN] geo.dat receiver x coordinates are not monotonic. "
+            "diff-p-adjacent uses file order pairs (0-1, 1-2, ...), not automatically sorted-by-x pairs.",
+            flush=True,
+        )
+
+def read_prior(path: str | Path) -> Prior:
+    vals = float_tokens(path)
+    if len(vals) < 26:
+        raise ValueError(f"prior.dat should contain at least 26 numeric values, got {len(vals)}")
+    prior = Prior(
+        nmin=int(vals[0]), nmax=int(vals[1]),
+        depmin=vals[2], depmax=vals[3], ddep=vals[4],
+        amin=vals[5], amax=vals[6], da=vals[7],
+        bmin=vals[8], bmax=vals[9], db=vals[10],
+        emin=vals[11], emax=vals[12], de=vals[13],
+        gmin=vals[14], gmax=vals[15], dg=vals[16],
+        dmin=vals[17], dmax=vals[18], dd=vals[19],
+        hmin=vals[20], hmax=vals[21], dh=vals[22],
+        zmin=vals[23], zmax=vals[24], dz=vals[25],
+    )
+    # Backward compatibility: older prior.dat files may still contain a final
+    # noise-prior triplet.  Field workflow treats noise as fixed from nobs.dat,
+    # so the triplet is ignored and is no longer written.
+    if len(vals) >= 29:
+        prior.tmin, prior.tmax, prior.dt = vals[26], vals[27], vals[28]
+    return prior
+
+
+def read_proposal(path: str | Path) -> Proposal:
+    vals = float_tokens(path)
+    if len(vals) < 9:
+        raise ValueError(f"prop.dat should contain 9 numeric values, got {len(vals)}")
+    return Proposal(
+        obstd=vals[0], depstd=vals[1], astd=vals[2], bstd=vals[3],
+        estd=vals[4], gstd=vals[5], dstd=vals[6], hstd=vals[7], zstd=vals[8],
+    )
+
+
+def validate_model(model: VTIModel) -> None:
+    """Strict physical/numerical checks copied from the validated vti_direct.py."""
+    if model.nlayer < 1:
+        raise ValueError("model must have at least one layer")
+    if not np.all(np.isfinite(model.dep)) or not np.all(np.diff(model.dep) > 0.0):
+        raise ValueError("Layer depths dep must be finite and strictly increasing")
+    if np.any(~np.isfinite(model.alpha)) or np.any(model.alpha <= 0.0):
+        raise ValueError("alpha must be finite and positive")
+    if np.any(~np.isfinite(model.beta)) or np.any(model.beta <= 0.0):
+        raise ValueError("beta must be finite and positive")
+    if np.any(~np.isfinite(model.epsilon)) or np.any(~np.isfinite(model.gamma)) or np.any(~np.isfinite(model.delta)):
+        raise ValueError("epsilon/gamma/delta must be finite")
+    if np.any(1.0 + 2.0 * model.epsilon <= 0.0):
+        raise ValueError("qP pmax is invalid because 1 + 2*epsilon <= 0")
+    if np.any(1.0 + 2.0 * model.gamma <= 0.0):
+        raise ValueError("qSH pmax is invalid because 1 + 2*gamma <= 0")
+
+
+# =============================================================================
+# Forward modelling: robust implementation synchronized with validated vti_direct.py
+# =============================================================================
+
+def direct_layer_thickness(z1: float, z2: float, model: VTIModel) -> np.ndarray:
+    top_z, bot_z = sorted((float(z1), float(z2)))
+    out = np.zeros(model.nlayer, dtype=float)
+    for k in range(model.nlayer):
+        layer_top = model.dep[k]
+        layer_bot = model.dep[k + 1] if k + 1 < model.nlayer else bot_z
+        out[k] = max(0.0, min(bot_z, layer_bot) - max(top_z, layer_top))
+    return out
+
+
+def layer_index_at_depth(z: float, model: VTIModel) -> int:
+    """Return the layer containing depth z.
+
+    Convention: dep[k] <= z < dep[k+1]. If z is exactly on an
+    interface, the lower layer is used. This matches np.searchsorted(...,
+    side="right") and avoids assigning an interface point to the layer
+    above it.
+    """
+    z = float(z)
+    if not math.isfinite(z):
+        raise ValueError(f"non-finite depth: {z}")
+    k = int(np.searchsorted(model.dep, z, side="right") - 1)
+    return max(0, min(k, model.nlayer - 1))
+
+
+def horizontal_velocity_for_wave(ip: int, k: int, model: VTIModel) -> float:
+    """Horizontal phase/group velocity for a same-depth direct horizontal path.
+
+    For a homogeneous VTI layer, pure horizontal propagation has the limiting
+    horizontal velocities used by pmax_for_wave():
+      qP  : alpha * sqrt(1 + 2*epsilon)
+      qSV : beta
+      qSH : beta * sqrt(1 + 2*gamma)
+    This branch is only used when total vertical path thickness is zero.
+    """
+    if ip == 1:
+        v = model.alpha[k] * math.sqrt(1.0 + 2.0 * model.epsilon[k])
+    elif ip == 2:
+        v = model.beta[k]
+    elif ip == 3:
+        v = model.beta[k] * math.sqrt(1.0 + 2.0 * model.gamma[k])
+    else:
+        raise ValueError("ip must be 1(qP), 2(qSV), or 3(qSH)")
+    if not math.isfinite(v) or v <= 0.0:
+        raise FloatingPointError(f"invalid horizontal velocity for {WAVES[ip]} in layer {k}: {v}")
+    return float(v)
+
+
+def horizontal_direct_result(ip: int, H: float, z: float, model: VTIModel, max_iter: int) -> dict:
+    """Return a result row for a same-depth horizontal direct path.
+
+    The qx formulation parameterizes px = qx*pmin/sqrt(1+qx^2), so a
+    perfectly horizontal path corresponds to the limit qx -> infinity and
+    px -> pmax of the current layer. To keep output finite and easy to read,
+    qx is written as 1e30 for H > 0. The physically important values here are
+    px and ttime.
+    """
+    k = layer_index_at_depth(z, model)
+    v_h = horizontal_velocity_for_wave(ip, k, model)
+    px = 1.0 / v_h if H > 0.0 else 0.0
+    qx = 1.0e30 if H > 0.0 else 0.0
+    ttime = float(H) / v_h if H > 0.0 else 0.0
+
+    Z = np.zeros(model.nlayer, dtype=float)
+    layer_dx = np.zeros(model.nlayer, dtype=float)
+    layer_dt = np.zeros(model.nlayer, dtype=float)
+    # Use zeros for inactive layers instead of NaN.
+    # This keeps layer_contributions.dat fully finite for validation/MCMC.
+    # For horizontal paths, only the source/receiver layer has physical values;
+    # all other layers remain 0.0 and should be interpreted as inactive.
+    layer_pz = np.zeros(model.nlayer)
+    layer_vz = np.zeros(model.nlayer)
+    layer_g0 = np.zeros(model.nlayer)
+    layer_g1 = np.zeros(model.nlayer)
+
+    layer_dx[k] = float(H)
+    layer_dt[k] = ttime
+    layer_pz[k] = 0.0
+    layer_vz[k] = 0.0
+    layer_g0[k] = 0.0
+    # For a pure horizontal limiting path, g1 is not used by the forward output.
+    # Keep it finite for downstream validation/MCMC.
+    layer_g1[k] = 0.0
+
+    history = [(float(qx), 0.0)]
+    if len(history) < max_iter:
+        history.extend([(0.0, 0.0)] * (max_iter - len(history)))
+    elif len(history) > max_iter:
+        history = history[:max_iter]
+
+    history_detail = [{
+        "qx": float(qx), "px": float(px), "Xcal": float(H), "f": 0.0,
+        "df": 0.0, "d2f": 0.0, "disc": 0.0,
+        "chosen_qx": float(qx), "chosen_f": 0.0,
+    }]
+
+    return {
+        "wave": WAVES[ip], "qx": qx, "px": px, "ttime": ttime,
+        "error": 0.0, "niter": 0, "converged": True,
+        "history": history, "history_detail": history_detail,
+        "layer_dx": layer_dx, "layer_dt": layer_dt,
+        "layer_pz": layer_pz, "layer_vz": layer_vz,
+        "layer_g0": layer_g0, "layer_g1": layer_g1,
+        "Z": Z.copy(),
+        "H": float(H), "dx_sum": float(H), "dx_minus_H": 0.0,
+        "horizontal_path": True, "horizontal_layer": k,
+    }
+
+
+def pmax_for_wave(ip: int, model: VTIModel) -> np.ndarray:
+    if ip == 1:
+        pmax = 1.0 / (model.alpha * np.sqrt(1.0 + 2.0 * model.epsilon))
+    elif ip == 2:
+        pmax = 1.0 / model.beta
+    elif ip == 3:
+        pmax = 1.0 / (model.beta * np.sqrt(1.0 + 2.0 * model.gamma))
+    else:
+        raise ValueError("ip must be 1(qP), 2(qSV), or 3(qSH)")
+    if np.any(~np.isfinite(pmax)) or np.any(pmax <= 0.0):
+        raise FloatingPointError(f"invalid pmax for wave {WAVES[ip]}")
+    return pmax
+
+
+def q_to_p(qx: float, pmin: float) -> float:
+    if not math.isfinite(qx):
+        raise FloatingPointError("non-finite qx")
+    qx = max(float(qx), 0.0)
+    return qx * pmin / math.sqrt(1.0 + qx * qx)
+
+
+def _strict_sqrt_arg(value: float, scale: float, name: str) -> float:
+    if not math.isfinite(value):
+        raise FloatingPointError(f"{name} is non-finite")
+    scale = max(float(scale), MIN_POSITIVE)
+    if value < -ROUND_TOL * scale:
+        raise FloatingPointError(f"{name} is negative: {value:.16e}, scale={scale:.16e}")
+    return max(value, 0.0)
+
+
+def g_derivatives(ip: int, px: float, a: float, b: float, eps: float, delta: float, gamma: float):
+    """Return g, g1, g2, g3 where pz^2 = g(px)."""
+    if _NUMBA_AVAILABLE and _g_derivatives_numba is not None:
+        ok, g0, g1, g2, g3 = _g_derivatives_numba(int(ip), float(px), float(a), float(b), float(eps), float(delta), float(gamma))
+        if ok:
+            return float(g0), float(g1), float(g2), float(g3)
+        raise FloatingPointError("invalid VTI slowness surface in numba g_derivatives")
+
+    if a <= 0.0 or b <= 0.0 or not all(math.isfinite(v) for v in (px, a, b, eps, delta, gamma)):
+        raise FloatingPointError("non-finite or non-positive VTI parameters")
+
+    if ip == 3:
+        A = 1.0 + 2.0 * gamma
+        if A <= 0.0:
+            raise FloatingPointError("qSH invalid because 1 + 2*gamma <= 0")
+        g0 = 1.0 / (b * b) - A * px * px
+        scale = max(abs(1.0 / (b * b)), abs(A * px * px), MIN_POSITIVE)
+        g0 = _strict_sqrt_arg(g0, scale, "qSH g0=pz^2")
+        return g0, -2.0 * A * px, -2.0 * A, 0.0
+
+    A = 1.0 + 2.0 * eps
+    if A <= 0.0:
+        raise FloatingPointError("qP/qSV invalid because 1 + 2*epsilon <= 0")
+
+    K = 1.0 + delta + (eps - delta) * a * a / (b * b)
+    B = 1.0 / (a * a) + 1.0 / (b * b) - 2.0 * K * px * px
+    B1 = -4.0 * K * px
+    B2 = -4.0 * K
+    B3 = 0.0
+
+    C = (A * px * px - 1.0 / (a * a)) * (px * px - 1.0 / (b * b))
+    C1 = 4.0 * A * px**3 - 2.0 * (A / (b * b) + 1.0 / (a * a)) * px
+    C2 = 12.0 * A * px * px - 2.0 * (A / (b * b) + 1.0 / (a * a))
+    C3 = 24.0 * A * px
+
+    U_raw = B * B - 4.0 * C
+    U_scale = max(B * B, abs(4.0 * C), MIN_POSITIVE)
+    U = _strict_sqrt_arg(U_raw, U_scale, "Christoffel discriminant U=B^2-4C")
+    r = math.sqrt(max(U, MIN_POSITIVE))
+
+    U1 = 2.0 * B * B1 - 4.0 * C1
+    U2 = 2.0 * (B1 * B1 + B * B2) - 4.0 * C2
+    U3 = 2.0 * (3.0 * B1 * B2 + B * B3) - 4.0 * C3
+
+    r1 = 0.5 * U1 / r
+    r2 = 0.5 * U2 / r - 0.25 * U1 * U1 / r**3
+    r3 = 0.5 * U3 / r - 0.75 * U1 * U2 / r**3 + 0.375 * U1**3 / r**5
+
+    sign = -1.0 if ip == 1 else 1.0
+    g0 = 0.5 * (B + sign * r)
+    g1 = 0.5 * (B1 + sign * r1)
+    g2 = 0.5 * (B2 + sign * r2)
+    g3 = 0.5 * (B3 + sign * r3)
+
+    g_scale = max(abs(B), abs(r), MIN_POSITIVE)
+    g0 = _strict_sqrt_arg(g0, g_scale, f"{WAVES[ip]} g0=pz^2")
+    return g0, g1, g2, g3
+
+
+def offset_value(ip: int, qx: float, H: float, Z: np.ndarray, model: VTIModel, pmin: float):
+    """Return f(qx)=Xcal-H and px using only first slowness derivatives.
+
+    This is the safe path used by the bracketed solver. It does not evaluate
+    G2/G3, so it remains well behaved near critical rays where pz^2 is close
+    to zero and higher derivatives are singular.
+    """
+    px = q_to_p(qx, pmin)
+    active = Z > 0.0
+    Xcal = 0.0
+    for k in range(model.nlayer):
+        if not active[k]:
+            continue
+        g0, g1, _, _ = g_derivatives(
+            ip, px,
+            model.alpha[k], model.beta[k], model.epsilon[k], model.delta[k], model.gamma[k],
+        )
+        root_g0 = math.sqrt(max(g0, MIN_POSITIVE))
+        G1 = 0.5 * g1 / root_g0
+        Xcal += -float(Z[k]) * G1
+    f = float(Xcal) - float(H)
+    if not all(math.isfinite(v) for v in (f, px, Xcal)):
+        raise FloatingPointError("non-finite offset value")
+    return f, px, float(Xcal)
+
+
+def G_derivatives(ip: int, px: float, model: VTIModel, active: np.ndarray | None = None):
+    """Return G derivatives only for layers crossed by the direct ray.
+
+    If an active layer is at or extremely close to the critical slowness
+    surface, G2/G3 are mathematically singular. In that case this function
+    raises FloatingPointError, and solve_qx() uses the bracketed fallback.
+    This avoids RuntimeWarning messages and avoids propagating inf/nan values
+    into MCMC likelihood calculations.
+    """
+    G1 = np.zeros(model.nlayer)
+    G2 = np.zeros(model.nlayer)
+    G3 = np.zeros(model.nlayer)
+
+    if active is None:
+        active = np.ones(model.nlayer, dtype=bool)
+    else:
+        active = np.asarray(active, dtype=bool)
+        if active.shape != (model.nlayer,):
+            raise ValueError(f"active mask shape must be ({model.nlayer},), got {active.shape}")
+
+    for k in range(model.nlayer):
+        if not active[k]:
+            continue
+
+        g0, g1, g2, g3 = g_derivatives(
+            ip, px,
+            model.alpha[k], model.beta[k], model.epsilon[k], model.delta[k], model.gamma[k],
+        )
+        if g0 <= CRITICAL_G0:
+            raise FloatingPointError(
+                f"near-critical {WAVES[ip]} derivative is unsafe in layer {k}: pz^2={g0:.16e}"
+            )
+        root_g0 = math.sqrt(g0)
+        root2 = root_g0 * root_g0
+        root3 = root2 * root_g0
+        root5 = root3 * root2
+        G1[k] = 0.5 * g1 / root_g0
+        G2[k] = -0.25 * g1 * g1 / root3 + 0.5 * g2 / root_g0
+        G3[k] = 0.375 * g1**3 / root5 - 0.75 * g1 * g2 / root3 + 0.5 * g3 / root_g0
+        if not all(math.isfinite(v) for v in (G1[k], G2[k], G3[k])):
+            raise FloatingPointError(f"non-finite {WAVES[ip]} G derivatives in layer {k}")
+    return G1, G2, G3
+
+
+def offset_and_derivatives(ip: int, qx: float, H: float, Z: np.ndarray, model: VTIModel, pmin: float):
+    px = q_to_p(qx, pmin)
+    active = Z > 0.0
+    G1, G2, G3 = G_derivatives(ip, px, model, active)
+    Xcal = -float(np.sum(Z * G1))
+    f = Xcal - H
+
+    dpdq = pmin * (1.0 + qx * qx)**(-1.5)
+    d2pdq2 = -3.0 * qx * pmin * (1.0 + qx * qx)**(-2.5)
+    term = G3 * dpdq * dpdq + G2 * d2pdq2
+    if not np.all(np.isfinite(term[active])):
+        raise FloatingPointError("non-finite second-derivative term")
+    dfdq = -float(np.sum(Z * G2)) * dpdq
+    d2fdq2 = -float(np.sum(Z * term))
+    if not all(math.isfinite(v) for v in (f, dfdq, d2fdq2, px, Xcal)):
+        raise FloatingPointError("non-finite offset equation value/derivative")
+    return f, dfdq, d2fdq2, px, Xcal
+
+
+def _safe_offset_for_trial(ip: int, qx: float, H: float, Z: np.ndarray, model: VTIModel, pmin: float):
+    """Safe f evaluation for candidate testing."""
+    if not math.isfinite(qx) or qx < 0.0:
+        raise FloatingPointError("invalid trial qx")
+    return offset_value(ip, qx, H, Z, model, pmin)
+
+
+def solve_qx(ip: int, H: float, Z: np.ndarray, model: VTIModel, stop: float, max_iter: int,
+             pmax_cache: np.ndarray | None = None,
+             store_history: bool = True,
+             qx_init: float | None = None):
+    active = Z > 0.0
+    history: list[tuple[float, float]] = []
+    history_detail: list[dict[str, float]] = []
+    if not np.any(active):
+        raise FloatingPointError("zero vertical path length: source/receiver may be in same depth interval")
+    if H == 0.0:
+        if not store_history:
+            return 0.0, 0.0, 0.0, 0, [], True, []
+        zero_detail = {
+            "qx": 0.0, "px": 0.0, "Xcal": 0.0, "f": 0.0,
+            "df": 0.0, "d2f": 0.0, "disc": 0.0, "chosen_qx": 0.0, "chosen_f": 0.0,
+        }
+        return 0.0, 0.0, 0.0, 0, [(0.0, 0.0)] * max_iter, True, [zero_detail]
+
+    # pmax depends only on the current VTI model and wave type, not on
+    # source/receiver geometry.  When supplied by forward_direct(), reuse the
+    # cached vector instead of recomputing it for every receiver pair.
+    pmax = pmax_for_wave(ip, model) if pmax_cache is None else np.asarray(pmax_cache, dtype=float)
+    if pmax.shape != (model.nlayer,):
+        raise FloatingPointError(f"invalid pmax_cache shape for {WAVES[ip]}: {pmax.shape}")
+    if not np.all(np.isfinite(pmax[active])) or np.any(pmax[active] <= 0.0):
+        raise FloatingPointError(f"invalid pmax for {WAVES[ip]}; check VTI parameter bounds")
+    pmin = float(np.min(pmax[active]))
+    if not math.isfinite(pmin) or pmin <= 0.0:
+        raise FloatingPointError("invalid pmin")
+
+    # Fast path used by MCMC/grid-search forward modelling.  It is mathematically
+    # the same bracketed qx solver, but compiled by numba and seeded with the
+    # qx from the current accepted model when available.  The diagnostic path
+    # keeps the pure-Python implementation below because it records history.
+    if _NUMBA_AVAILABLE and _solve_qx_numba is not None and not store_history:
+        qx0 = float(qx_init) if qx_init is not None and math.isfinite(float(qx_init)) else math.nan
+        ok, qx_fast, px_fast, f_fast, niter_fast, conv_fast = _solve_qx_numba(
+            int(ip), float(H), np.asarray(Z, dtype=float),
+            model.alpha, model.beta, model.epsilon, model.gamma, model.delta,
+            np.asarray(pmax, dtype=float), float(stop), int(max_iter), qx0,
+        )
+        if not ok:
+            raise FloatingPointError(f"numba qx solver failed for {WAVES[ip]}")
+        return float(qx_fast), float(px_fast), float(f_fast), int(niter_fast), [], bool(conv_fast), []
+
+    # Bracket the root using f-only evaluations. qx=0 gives Xcal=0, so f=-H.
+    q_low = 0.0
+    f_low, px_low, x_low = offset_value(ip, q_low, H, Z, model, pmin)
+    if abs(f_low) <= stop:
+        if not store_history:
+            return 0.0, px_low, f_low, 0, [], True, []
+        zero_detail = {
+            "qx": 0.0, "px": px_low, "Xcal": x_low, "f": f_low,
+            "df": math.nan, "d2f": math.nan, "disc": math.nan,
+            "chosen_qx": 0.0, "chosen_f": f_low,
+        }
+        return 0.0, px_low, f_low, 0, [(0.0, f_low)] * max_iter, True, [zero_detail]
+
+    q_high = 1.0
+    f_high = math.nan
+    px_high = math.nan
+    x_high = math.nan
+    for _ in range(BRACKET_EXPAND_ITERS):
+        try:
+            f_high, px_high, x_high = offset_value(ip, q_high, H, Z, model, pmin)
+        except FloatingPointError:
+            q_high *= 0.5
+            continue
+        if f_high >= 0.0:
+            break
+        q_high *= 2.0
+        if q_high > QX_UPPER_LIMIT:
+            break
+    if not math.isfinite(f_high) or f_high < 0.0:
+        raise FloatingPointError(
+            f"Cannot bracket {WAVES[ip]} qx root: f_low={f_low:.6e}, f_high={f_high:.6e}, q_high={q_high:.6e}"
+        )
+
+    if qx_init is not None and math.isfinite(float(qx_init)) and q_low < float(qx_init) < q_high:
+        qx = float(qx_init)
+    else:
+        qx = min(max(1.0, q_low), q_high)
+    it_done = 0
+    converged = False
+    max_internal_iter = max(int(max_iter), ROBUST_SOLVE_MIN_ITERS)
+
+    for it in range(1, max_internal_iter + 1):
+        # Prefer full derivatives when safe; otherwise use f-only evaluation.
+        derivative_ok = False
+        df = math.nan
+        d2f = math.nan
+        disc = math.nan
+        try:
+            f, df, d2f, px, Xcal = offset_and_derivatives(ip, qx, H, Z, model, pmin)
+            derivative_ok = True
+        except FloatingPointError:
+            f, px, Xcal = offset_value(ip, qx, H, Z, model, pmin)
+
+        it_done = it
+        if store_history and len(history) < max_iter:
+            history.append((float(qx), float(f)))
+
+        if abs(f) <= stop:
+            converged = True
+            if store_history and len(history_detail) < max_iter:
+                history_detail.append({
+                    "qx": float(qx), "px": float(px), "Xcal": float(Xcal), "f": float(f),
+                    "df": float(df), "d2f": float(d2f), "disc": float(disc),
+                    "chosen_qx": float(qx), "chosen_f": float(f),
+                })
+            break
+
+        # Maintain a valid bracket.
+        if f < 0.0:
+            q_low = qx
+            f_low = f
+        else:
+            q_high = qx
+            f_high = f
+
+        candidates = []
+        if derivative_ok:
+            disc = df * df - 2.0 * d2f * f
+            if abs(d2f) > 1e-30 and math.isfinite(disc) and disc >= 0.0:
+                root = math.sqrt(disc)
+                candidates.extend([qx + (-df + root) / d2f, qx + (-df - root) / d2f])
+            if abs(df) > 1e-30 and math.isfinite(df):
+                candidates.append(qx - f / df)
+
+        # Always include the bracket midpoint as a safe fallback.
+        candidates.append(0.5 * (q_low + q_high))
+
+        best_q = None
+        best_f = None
+        best_err = float("inf")
+        for qtrial in candidates:
+            if not math.isfinite(qtrial):
+                continue
+            if qtrial <= q_low or qtrial >= q_high:
+                continue
+            try:
+                ftrial, _, _ = _safe_offset_for_trial(ip, qtrial, H, Z, model, pmin)
+            except FloatingPointError:
+                continue
+            err = abs(ftrial)
+            if err < best_err:
+                best_q = qtrial
+                best_f = ftrial
+                best_err = err
+
+        if best_q is None:
+            best_q = 0.5 * (q_low + q_high)
+            best_f, _, _ = offset_value(ip, best_q, H, Z, model, pmin)
+
+        if store_history and len(history_detail) < max_iter:
+            history_detail.append({
+                "qx": float(qx), "px": float(px), "Xcal": float(Xcal), "f": float(f),
+                "df": float(df), "d2f": float(d2f), "disc": float(disc),
+                "chosen_qx": float(best_q), "chosen_f": float(best_f),
+            })
+        qx = best_q
+
+    # Critical fix: recompute f and px for the final qx after the last update.
+    f_final, px_final, Xcal_final = offset_value(ip, qx, H, Z, model, pmin)
+    if abs(f_final) <= stop:
+        converged = True
+    if store_history:
+        if len(history) == 0 or history[-1][0] != float(qx):
+            history.append((float(qx), float(f_final)))
+        if not history_detail or history_detail[-1]["qx"] != float(qx):
+            history_detail.append({
+                "qx": float(qx), "px": float(px_final), "Xcal": float(Xcal_final), "f": float(f_final),
+                "df": math.nan, "d2f": math.nan, "disc": math.nan,
+                "chosen_qx": float(qx), "chosen_f": float(f_final),
+            })
+
+        if len(history) < max_iter:
+            history.extend([(0.0, 0.0)] * (max_iter - len(history)))
+        elif len(history) > max_iter:
+            history = history[:max_iter - 1] + [(float(qx), float(f_final))]
+
+        if len(history_detail) > max_iter:
+            history_detail = history_detail[:max_iter - 1] + [{
+                "qx": float(qx), "px": float(px_final), "Xcal": float(Xcal_final), "f": float(f_final),
+                "df": math.nan, "d2f": math.nan, "disc": math.nan,
+                "chosen_qx": float(qx), "chosen_f": float(f_final),
+            }]
+    else:
+        history = []
+        history_detail = []
+
+    return qx, px_final, f_final, min(it_done, max_internal_iter), history, converged, history_detail
+
+def travel_time_and_layer_dx(ip: int, px: float, Z: np.ndarray, model: VTIModel):
+    dt = np.zeros(model.nlayer)
+    dx = np.zeros(model.nlayer)
+    # Use zeros for inactive layers instead of NaN.
+    # This keeps layer_contributions.dat fully finite for downstream validation/MCMC.
+    # Inactive layers are already identified by Z[k] == 0.0, so pz/Vz/g0/g1=0.0
+    # should be interpreted as "not used", not as a physical value.
+    pz_arr = np.zeros(model.nlayer)
+    vz_arr = np.zeros(model.nlayer)
+    g0_arr = np.zeros(model.nlayer)
+    g1_arr = np.zeros(model.nlayer)
+    for k in range(model.nlayer):
+        if Z[k] <= 0.0:
+            continue
+        g0, g1, _, _ = g_derivatives(
+            ip, px,
+            model.alpha[k], model.beta[k], model.epsilon[k], model.delta[k], model.gamma[k],
+        )
+        pz = math.sqrt(max(g0, MIN_POSITIVE))
+        dS_dpx = -g1
+        dS_dpz = 2.0 * pz
+        denom = px * dS_dpx + pz * dS_dpz
+        if not math.isfinite(denom) or abs(denom) < 1e-30:
+            raise FloatingPointError("zero or non-finite group-velocity denominator")
+        Vz = dS_dpz / denom
+        if not math.isfinite(Vz) or Vz <= 0.0:
+            raise FloatingPointError(f"invalid vertical group velocity Vz={Vz}")
+        dt[k] = Z[k] / Vz
+        dx[k] = -Z[k] * (0.5 * g1 / pz)
+        pz_arr[k] = pz
+        vz_arr[k] = Vz
+        g0_arr[k] = g0
+        g1_arr[k] = g1
+    total = float(np.sum(dt))
+    if not math.isfinite(total) or total < 0.0:
+        raise FloatingPointError("invalid travel time")
+    return total, dx, dt, pz_arr, vz_arr, g0_arr, g1_arr
+
+def trace_direct_pair(sx: float, sz: float, rx: float, rz: float, model: VTIModel, stop: float, max_iter: int):
+    H = abs(float(rx) - float(sx))
+    Z = direct_layer_thickness(sz, rz, model)
+    rows = []
+
+    # Special case: same-depth horizontal path. The qx root formulation uses
+    # vertical layer thicknesses and cannot solve a path with sum(Z)=0. In this
+    # case, compute the direct travel time from the horizontal velocity of the
+    # layer containing the source/receiver depth.
+    if not np.any(Z > 0.0):
+        z_mid = 0.5 * (float(sz) + float(rz))
+        for ip in (1, 2, 3):
+            rows.append(horizontal_direct_result(ip, H, z_mid, model, max_iter))
+        return rows
+
+    for ip in (1, 2, 3):
+        qx, px, err, niter, history, converged, history_detail = solve_qx(ip, H, Z, model, stop, max_iter)
+        ttime, layer_dx, layer_dt, layer_pz, layer_vz, layer_g0, layer_g1 = travel_time_and_layer_dx(ip, px, Z, model)
+        dx_sum = float(np.sum(layer_dx))
+        rows.append({
+            "wave": WAVES[ip], "qx": qx, "px": px, "ttime": ttime,
+            "error": err, "niter": niter, "converged": converged,
+            "history": history, "history_detail": history_detail,
+            "layer_dx": layer_dx, "layer_dt": layer_dt,
+            "layer_pz": layer_pz, "layer_vz": layer_vz,
+            "layer_g0": layer_g0, "layer_g1": layer_g1,
+            "Z": Z.copy(),
+            "H": H, "dx_sum": dx_sum, "dx_minus_H": dx_sum - H,
+            "horizontal_path": False, "horizontal_layer": -1,
+        })
+    return rows
+
+
+def travel_time(ip: int, px: float, Z: np.ndarray, model: VTIModel) -> float:
+    """Compatibility wrapper used by older likelihood code."""
+    if _NUMBA_AVAILABLE and _travel_time_numba is not None:
+        ok, total = _travel_time_numba(
+            int(ip), float(px), np.asarray(Z, dtype=float),
+            model.alpha, model.beta, model.epsilon, model.gamma, model.delta,
+        )
+        if ok:
+            return float(total)
+        raise FloatingPointError("numba travel_time failed")
+    ttime, *_ = travel_time_and_layer_dx(ip, px, Z, model)
+    return float(ttime)
+
+
+def qx_acceptance_tolerance(stop: float) -> float:
+    """Tolerance used only to decide whether qx residual should abort forward.
+
+    The qx solver still tries to satisfy `stop`.  This looser threshold prevents
+    near-horizontal paths with tiny vertical thickness from being treated as
+    invalid when the final offset residual is only a few micro-meters.
+    """
+    stop = float(stop)
+    if not math.isfinite(stop) or stop <= 0.0:
+        stop = DEFAULT_STOP
+    return max(FORWARD_OFFSET_FAIL_FACTOR * stop, FORWARD_OFFSET_FAIL_MIN)
+
+
+def _wave_pmax_cache(model: VTIModel, needed_waves: tuple[str, ...] | set[str]) -> dict[int, np.ndarray]:
+    """Precompute pmax vectors once per model/wave for the robust qx solver."""
+    needed = set(needed_waves)
+    cache: dict[int, np.ndarray] = {}
+    if "P" in needed:
+        cache[1] = pmax_for_wave(1, model)
+    if "SV" in needed:
+        cache[2] = pmax_for_wave(2, model)
+    if "SH" in needed:
+        cache[3] = pmax_for_wave(3, model)
+    return cache
+
+
+def forward_direct_source(geo: Geometry, model: VTIModel, isrc: int,
+                          stop: float = DEFAULT_STOP, max_iter: int = DEFAULT_MAX_ITER,
+                          needed_waves: tuple[str, ...] = ("P", "SV", "SH"),
+                          pmax_cache: dict[int, np.ndarray] | None = None,
+                          qx_init_rows: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+                          return_qx: bool = False,
+                          strict_qx_check: bool = True):
+    """Compute direct-wave travel times for one source only.
+
+    This is used by the component-wise MCMC update.  If only sx[i] or sz[i]
+    changes, all other sources have unchanged predictions, so only source i
+    needs to be recomputed.
+    """
+    needed = set(needed_waves)
+    if isrc < 0 or isrc >= geo.ns:
+        raise IndexError(f"source index out of range: {isrc}")
+    if pmax_cache is None:
+        pmax_cache = _wave_pmax_cache(model, needed)
+
+    tp_row = np.full(geo.nr, np.nan)
+    tsv_row = np.full(geo.nr, np.nan)
+    tsh_row = np.full(geo.nr, np.nan)
+    qx_p_row = np.full(geo.nr, np.nan)
+    qx_sv_row = np.full(geo.nr, np.nan)
+    qx_sh_row = np.full(geo.nr, np.nan)
+
+    if qx_init_rows is not None:
+        qx_init_p, qx_init_sv, qx_init_sh = qx_init_rows
+    else:
+        qx_init_p = qx_init_sv = qx_init_sh = None
+
+    sx = float(geo.sx[isrc])
+    sz = float(geo.sz[isrc])
+    if not math.isfinite(sx) or not math.isfinite(sz):
+        raise FloatingPointError(f"non-finite source coordinate at source {isrc}: sx={sx}, sz={sz}")
+
+    for ir in range(geo.nr):
+        rx = float(geo.rx[ir])
+        rz = float(geo.rz[ir])
+        if not math.isfinite(rx) or not math.isfinite(rz):
+            raise FloatingPointError(f"non-finite receiver coordinate at receiver {ir}: rx={rx}, rz={rz}")
+
+        H = abs(rx - sx)
+        Z = direct_layer_thickness(sz, rz, model)
+
+        # Same-depth horizontal direct path: use exactly the same branch as vti_direct.py.
+        if not np.any(Z > 0.0):
+            z_mid = 0.5 * (sz + rz)
+            if "P" in needed:
+                hres = horizontal_direct_result(1, H, z_mid, model, max_iter)
+                tp_row[ir] = hres["ttime"]
+                qx_p_row[ir] = hres["qx"]
+            if "SV" in needed:
+                hres = horizontal_direct_result(2, H, z_mid, model, max_iter)
+                tsv_row[ir] = hres["ttime"]
+                qx_sv_row[ir] = hres["qx"]
+            if "SH" in needed:
+                hres = horizontal_direct_result(3, H, z_mid, model, max_iter)
+                tsh_row[ir] = hres["ttime"]
+                qx_sh_row[ir] = hres["qx"]
+            continue
+
+        fail_tol = qx_acceptance_tolerance(stop)
+        if "P" in needed:
+            qx0 = None if qx_init_p is None else qx_init_p[ir]
+            qx1, px1, err1, _, _, conv1, _ = solve_qx(1, H, Z, model, stop, max_iter, pmax_cache=pmax_cache[1], store_history=False, qx_init=qx0)
+            if strict_qx_check and abs(err1) > fail_tol:
+                raise FloatingPointError(
+                    f"qP qx solver did not converge: source={isrc}, receiver={ir}, "
+                    f"error={err1:.6e}, stop={float(stop):.6e}, fail_tol={fail_tol:.6e}, conv={int(bool(conv1))}"
+                )
+            tp_row[ir] = travel_time(1, px1, Z, model)
+            qx_p_row[ir] = qx1
+        if "SV" in needed:
+            qx0 = None if qx_init_sv is None else qx_init_sv[ir]
+            qx2, px2, err2, _, _, conv2, _ = solve_qx(2, H, Z, model, stop, max_iter, pmax_cache=pmax_cache[2], store_history=False, qx_init=qx0)
+            if strict_qx_check and abs(err2) > fail_tol:
+                raise FloatingPointError(
+                    f"qSV qx solver did not converge: source={isrc}, receiver={ir}, "
+                    f"error={err2:.6e}, stop={float(stop):.6e}, fail_tol={fail_tol:.6e}, conv={int(bool(conv2))}"
+                )
+            tsv_row[ir] = travel_time(2, px2, Z, model)
+            qx_sv_row[ir] = qx2
+        if "SH" in needed:
+            qx0 = None if qx_init_sh is None else qx_init_sh[ir]
+            qx3, px3, err3, _, _, conv3, _ = solve_qx(3, H, Z, model, stop, max_iter, pmax_cache=pmax_cache[3], store_history=False, qx_init=qx0)
+            if strict_qx_check and abs(err3) > fail_tol:
+                raise FloatingPointError(
+                    f"qSH qx solver did not converge: source={isrc}, receiver={ir}, "
+                    f"error={err3:.6e}, stop={float(stop):.6e}, fail_tol={fail_tol:.6e}, conv={int(bool(conv3))}"
+                )
+            tsh_row[ir] = travel_time(3, px3, Z, model)
+            qx_sh_row[ir] = qx3
+
+    if "P" in needed and not np.all(np.isfinite(tp_row)):
+        raise FloatingPointError(f"non-finite qP travel times for source {isrc}")
+    if "SV" in needed and not np.all(np.isfinite(tsv_row)):
+        raise FloatingPointError(f"non-finite qSV travel times for source {isrc}")
+    if "SH" in needed and not np.all(np.isfinite(tsh_row)):
+        raise FloatingPointError(f"non-finite qSH travel times for source {isrc}")
+    rows = (tp_row, tsv_row, tsh_row)
+    if return_qx:
+        return rows, (qx_p_row, qx_sv_row, qx_sh_row)
+    return rows
+
+
+def _forward_direct_source_worker(args):
+    """Process-pool worker for one-source direct-wave forward modelling."""
+    geo, model, isrc, stop, max_iter, needed_waves, pmax_cache, qx_init_rows, return_qx, strict_qx_check = args
+    out = forward_direct_source(
+        geo, model, isrc,
+        stop=stop, max_iter=max_iter,
+        needed_waves=needed_waves,
+        pmax_cache=pmax_cache,
+        qx_init_rows=qx_init_rows,
+        return_qx=return_qx,
+        strict_qx_check=strict_qx_check,
+    )
+    return isrc, out
+
+
+def forward_direct(geo: Geometry, model: VTIModel, stop: float = DEFAULT_STOP, max_iter: int = DEFAULT_MAX_ITER,
+                   needed_waves: tuple[str, ...] = ("P", "SV", "SH"),
+                   executor: cf.ProcessPoolExecutor | None = None,
+                   qx_init_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+                   return_qx: bool = False,
+                   strict_qx_check: bool = True):
+    """Compute direct-wave travel times with the same robust qx solver as vti_direct.py.
+
+    Important differences from the older MCMC forward code:
+      1. no silent clipping of invalid VTI slowness surfaces;
+      2. bracketed Newton/bisection fallback near critical rays;
+      3. final qx is re-evaluated after the last update;
+      4. same-depth horizontal paths use the dedicated horizontal-velocity branch;
+      5. unused wave arrays remain NaN, preventing accidental likelihood use;
+      6. pmax_for_wave() is cached once per model/wave, not recomputed per receiver.
+    """
+    validate_model(model)
+
+    needed = set(needed_waves)
+    pmax_cache = _wave_pmax_cache(model, needed)
+
+    tp = np.full((geo.ns, geo.nr), np.nan)
+    tsv = np.full((geo.ns, geo.nr), np.nan)
+    tsh = np.full((geo.ns, geo.nr), np.nan)
+    qx_p = np.full((geo.ns, geo.nr), np.nan)
+    qx_sv = np.full((geo.ns, geo.nr), np.nan)
+    qx_sh = np.full((geo.ns, geo.nr), np.nan)
+
+    def _qx_rows_for_source(i: int):
+        if qx_init_cache is None:
+            return None
+        return tuple(arr[i, :].copy() for arr in qx_init_cache)
+
+    if executor is None or geo.ns <= 1:
+        for isrc in range(geo.ns):
+            out = forward_direct_source(
+                geo, model, isrc,
+                stop=stop, max_iter=max_iter,
+                needed_waves=tuple(needed),
+                pmax_cache=pmax_cache,
+                qx_init_rows=_qx_rows_for_source(isrc),
+                return_qx=return_qx,
+                strict_qx_check=strict_qx_check,
+            )
+            if return_qx:
+                (tp_row, tsv_row, tsh_row), (qx_p_row, qx_sv_row, qx_sh_row) = out
+            else:
+                tp_row, tsv_row, tsh_row = out
+            if "P" in needed:
+                tp[isrc, :] = tp_row
+                if return_qx:
+                    qx_p[isrc, :] = qx_p_row
+            if "SV" in needed:
+                tsv[isrc, :] = tsv_row
+                if return_qx:
+                    qx_sv[isrc, :] = qx_sv_row
+            if "SH" in needed:
+                tsh[isrc, :] = tsh_row
+                if return_qx:
+                    qx_sh[isrc, :] = qx_sh_row
+    else:
+        tasks = (
+            (geo, model, isrc, stop, max_iter, tuple(needed), pmax_cache, _qx_rows_for_source(isrc), return_qx, strict_qx_check)
+            for isrc in range(geo.ns)
+        )
+        for isrc, out in executor.map(_forward_direct_source_worker, tasks, chunksize=1):
+            if return_qx:
+                (tp_row, tsv_row, tsh_row), (qx_p_row, qx_sv_row, qx_sh_row) = out
+            else:
+                tp_row, tsv_row, tsh_row = out
+            if "P" in needed:
+                tp[isrc, :] = tp_row
+                if return_qx:
+                    qx_p[isrc, :] = qx_p_row
+            if "SV" in needed:
+                tsv[isrc, :] = tsv_row
+                if return_qx:
+                    qx_sv[isrc, :] = qx_sv_row
+            if "SH" in needed:
+                tsh[isrc, :] = tsh_row
+                if return_qx:
+                    qx_sh[isrc, :] = qx_sh_row
+
+    if "P" in needed and not np.all(np.isfinite(tp)):
+        raise FloatingPointError("non-finite qP travel times in forward_direct")
+    if "SV" in needed and not np.all(np.isfinite(tsv)):
+        raise FloatingPointError("non-finite qSV travel times in forward_direct")
+    if "SH" in needed and not np.all(np.isfinite(tsh)):
+        raise FloatingPointError("non-finite qSH travel times in forward_direct")
+    pred = (tp, tsv, tsh)
+    if return_qx:
+        return pred, (qx_p, qx_sv, qx_sh)
+    return pred
+
+# =============================================================================
+# Parameter vector, priors, proposal, likelihood
+# =============================================================================
+
+def active_layer_indices(model: VTIModel, fix_last_layer: bool) -> np.ndarray:
+    n = model.nlayer - 1 if fix_last_layer else model.nlayer
+    return np.arange(max(n, 0), dtype=int)
+
+
+def active_depth_indices(model: VTIModel) -> np.ndarray:
+    """Internal layer-interface depths to invert.
+
+    dep[0] is the fixed model top, and dep[nlayer-1] is the fixed bottom
+    depth node/top of the bottom half-space.  Only dep[1] through
+    dep[nlayer-2] are updated by MCMC.  For the current field model this keeps
+    dep[0] = 200 m and dep[-1] = 2000 m fixed, while allowing each internal
+    interface to move within its prior window.
+    """
+    return np.arange(1, max(model.nlayer - 1, 1), dtype=int)
+
+
+def pack_params(geo: Geometry, model: VTIModel, invert_depths: bool, fix_last_layer: bool,
+                fix_velocity: bool = False) -> np.ndarray:
+    layers = active_layer_indices(model, fix_last_layer)
+    parts = []
+    if fix_velocity:
+        parts.extend([geo.sx, geo.sz])
+        return np.concatenate([np.asarray(p, dtype=float).ravel() for p in parts])
+    if invert_depths:
+        # dep[0] and dep[-1] are fixed; update internal layer interfaces only.
+        depth_idx = active_depth_indices(model)
+        if len(depth_idx) > 0:
+            parts.append(model.dep[depth_idx])
+    for name in ["alpha", "beta", "epsilon", "gamma", "delta"]:
+        arr = getattr(model, name)
+        parts.append(arr[layers])
+    parts.extend([geo.sx, geo.sz])
+    return np.concatenate([np.asarray(p, dtype=float).ravel() for p in parts])
+
+
+def unpack_params(theta: np.ndarray, template_geo: Geometry, template_model: VTIModel,
+                  invert_depths: bool, fix_last_layer: bool,
+                  fix_velocity: bool = False) -> Tuple[Geometry, VTIModel]:
+    geo = Geometry(template_geo.sx.copy(), template_geo.sz.copy(), template_geo.rx.copy(), template_geo.rz.copy())
+    model = VTIModel(
+        dep=template_model.dep.copy(), alpha=template_model.alpha.copy(), beta=template_model.beta.copy(),
+        epsilon=template_model.epsilon.copy(), gamma=template_model.gamma.copy(), delta=template_model.delta.copy(),
+    )
+    layers = active_layer_indices(model, fix_last_layer)
+    i = 0
+    if fix_velocity:
+        ns = geo.ns
+        if len(theta) != 2 * ns:
+            raise ValueError(f"fix_velocity=True expects theta length {2*ns}, got {len(theta)}")
+        geo.sx = theta[i:i + ns].copy(); i += ns
+        geo.sz = theta[i:i + ns].copy(); i += ns
+        return geo, model
+    if invert_depths:
+        depth_idx = active_depth_indices(model)
+        n = len(depth_idx)
+        if n:
+            model.dep[depth_idx] = theta[i:i + n]
+            i += n
+    for name in ["alpha", "beta", "epsilon", "gamma", "delta"]:
+        n = len(layers)
+        getattr(model, name)[layers] = theta[i:i + n]
+        i += n
+    geo.sx = theta[i:i + geo.ns].copy(); i += geo.ns
+    geo.sz = theta[i:i + geo.ns].copy(); i += geo.ns
+    return geo, model
+
+
+def proposal_std_vector(model: VTIModel, geo: Geometry, prop: Proposal,
+                        invert_depths: bool, fix_last_layer: bool,
+                        fix_velocity: bool = False) -> np.ndarray:
+    layers = active_layer_indices(model, fix_last_layer)
+    std = []
+    if fix_velocity:
+        std.extend([prop.hstd] * geo.ns)
+        std.extend([prop.zstd] * geo.ns)
+        std = np.asarray(std, dtype=float)
+        std[std <= 0.0] = 1e-12
+        return std
+    if invert_depths:
+        depth_idx = active_depth_indices(model)
+        std.extend([prop.depstd] * len(depth_idx))
+    std.extend([prop.astd] * len(layers))
+    std.extend([prop.bstd] * len(layers))
+    std.extend([prop.estd] * len(layers))
+    std.extend([prop.gstd] * len(layers))
+    std.extend([prop.dstd] * len(layers))
+    std.extend([prop.hstd] * geo.ns)
+    std.extend([prop.zstd] * geo.ns)
+    std = np.asarray(std, dtype=float)
+    std[std <= 0.0] = 1e-12
+    return std
+
+
+def prior_ok(geo: Geometry, model: VTIModel, initial_model: VTIModel, prior: Prior,
+             invert_depths: bool, fix_last_layer: bool,
+             fix_velocity: bool = False) -> bool:
+    if model.nlayer < prior.nmin or model.nlayer > prior.nmax:
+        return False
+    if not np.all(np.diff(model.dep) > 0.0):
+        return False
+    if np.any(geo.sx < prior.hmin) or np.any(geo.sx > prior.hmax):
+        return False
+    if np.any(geo.sz < prior.zmin) or np.any(geo.sz > prior.zmax):
+        return False
+    if fix_velocity:
+        return True
+    layers = active_layer_indices(model, fix_last_layer)
+
+    if invert_depths:
+        depth_idx = active_depth_indices(model)
+        for k in depth_idx:
+            if not (prior.depmin <= model.dep[k] <= prior.depmax):
+                return False
+            if abs(model.dep[k] - initial_model.dep[k]) > prior.ddep:
+                return False
+
+    checks = [
+        (model.alpha[layers], initial_model.alpha[layers], prior.amin, prior.amax, prior.da),
+        (model.beta[layers], initial_model.beta[layers], prior.bmin, prior.bmax, prior.db),
+        (model.epsilon[layers], initial_model.epsilon[layers], prior.emin, prior.emax, prior.de),
+        (model.gamma[layers], initial_model.gamma[layers], prior.gmin, prior.gmax, prior.dg),
+        (model.delta[layers], initial_model.delta[layers], prior.dmin, prior.dmax, prior.dd),
+    ]
+    for val, ini, lo, hi, max_dev in checks:
+        if np.any(~np.isfinite(val)) or np.any(val < lo) or np.any(val > hi):
+            return False
+        # MATLAB forward1 uses da/db/de/dg/dd as max deviation from initial.
+        if np.isfinite(max_dev) and max_dev > 0.0 and np.any(np.abs(val - ini) > max_dev):
+            return False
+
+    if np.any(geo.sx < prior.hmin) or np.any(geo.sx > prior.hmax):
+        return False
+    if np.any(geo.sz < prior.zmin) or np.any(geo.sz > prior.zmax):
+        return False
+    return True
+
+
+def _array_violation_messages(name: str, values: np.ndarray, lo: float, hi: float,
+                              initial: np.ndarray | None = None,
+                              max_dev: float | None = None,
+                              index_offset: int = 0) -> list[str]:
+    """Return readable prior-bound violation messages for one parameter array."""
+    msgs: list[str] = []
+    arr = np.asarray(values, dtype=float)
+    ini = None if initial is None else np.asarray(initial, dtype=float)
+
+    bad_finite = np.where(~np.isfinite(arr))[0]
+    for ii in bad_finite[:10]:
+        msgs.append(f"{name}[{ii + index_offset}] is non-finite: {arr[ii]!r}")
+
+    bad_lo = np.where(np.isfinite(arr) & (arr < lo))[0]
+    for ii in bad_lo[:10]:
+        msgs.append(f"{name}[{ii + index_offset}]={arr[ii]:.12g} < prior min {lo:.12g}")
+
+    bad_hi = np.where(np.isfinite(arr) & (arr > hi))[0]
+    for ii in bad_hi[:10]:
+        msgs.append(f"{name}[{ii + index_offset}]={arr[ii]:.12g} > prior max {hi:.12g}")
+
+    if ini is not None and max_dev is not None and np.isfinite(max_dev) and max_dev > 0.0:
+        dev = np.abs(arr - ini)
+        bad_dev = np.where(np.isfinite(dev) & (dev > max_dev))[0]
+        for ii in bad_dev[:10]:
+            msgs.append(
+                f"{name}[{ii + index_offset}] deviation={dev[ii]:.12g} > prior max deviation {max_dev:.12g} "
+                f"(value={arr[ii]:.12g}, initial={ini[ii]:.12g})"
+            )
+    return msgs
+
+
+def prior_violation_messages(geo: Geometry, model: VTIModel, initial_model: VTIModel, prior: Prior,
+                             invert_depths: bool, fix_last_layer: bool,
+                             fix_velocity: bool = False) -> list[str]:
+    """Detailed version of prior_ok(), used only for diagnostics."""
+    msgs: list[str] = []
+    if model.nlayer < prior.nmin or model.nlayer > prior.nmax:
+        msgs.append(f"nlayer={model.nlayer} is outside [{prior.nmin}, {prior.nmax}]")
+
+    if not np.all(np.isfinite(model.dep)):
+        msgs.append("layer depths contain non-finite values")
+    if model.dep.size >= 2:
+        bad_order = np.where(np.diff(model.dep) <= 0.0)[0]
+        for k in bad_order[:10]:
+            msgs.append(
+                f"layer depths are not strictly increasing at interface {k}->{k+1}: "
+                f"dep[{k}]={model.dep[k]:.12g}, dep[{k+1}]={model.dep[k+1]:.12g}"
+            )
+
+    if fix_velocity:
+        msgs.extend(_array_violation_messages("sx", geo.sx, prior.hmin, prior.hmax))
+        msgs.extend(_array_violation_messages("sz", geo.sz, prior.zmin, prior.zmax))
+        return msgs
+
+    layers = active_layer_indices(model, fix_last_layer)
+    layer_offset = int(layers[0]) if len(layers) else 0
+
+    if invert_depths:
+        depth_idx = active_depth_indices(model)
+        if len(depth_idx):
+            msgs.extend(_array_violation_messages(
+                "dep", model.dep[depth_idx], prior.depmin, prior.depmax,
+                initial=initial_model.dep[depth_idx], max_dev=prior.ddep,
+                index_offset=int(depth_idx[0]),
+            ))
+
+    checks = [
+        ("alpha", model.alpha[layers], initial_model.alpha[layers], prior.amin, prior.amax, prior.da),
+        ("beta", model.beta[layers], initial_model.beta[layers], prior.bmin, prior.bmax, prior.db),
+        ("epsilon", model.epsilon[layers], initial_model.epsilon[layers], prior.emin, prior.emax, prior.de),
+        ("gamma", model.gamma[layers], initial_model.gamma[layers], prior.gmin, prior.gmax, prior.dg),
+        ("delta", model.delta[layers], initial_model.delta[layers], prior.dmin, prior.dmax, prior.dd),
+    ]
+    for name, val, ini, lo, hi, max_dev in checks:
+        msgs.extend(_array_violation_messages(name, val, lo, hi, initial=ini, max_dev=max_dev, index_offset=layer_offset))
+
+    msgs.extend(_array_violation_messages("sx", geo.sx, prior.hmin, prior.hmax))
+    msgs.extend(_array_violation_messages("sz", geo.sz, prior.zmin, prior.zmax))
+    return msgs
+
+
+def print_initial_objective_diagnostics(theta: np.ndarray, template_geo: Geometry, template_model: VTIModel,
+                                        initial_model: VTIModel, prior: Prior, obs: ObsData,
+                                        invert_depths: bool, fix_last_layer: bool,
+                                        qx_stop: float, qx_max_iter: int,
+                                        like: LikelihoodConfig,
+                                        fix_velocity: bool = False) -> None:
+    """Print detailed reason why the initial model gives inf misfit.
+
+    This function is called only when the initial objective is non-finite, so it
+    does not slow down normal MCMC iterations.
+    """
+    print("[INIT-CHECK] Initial objective is non-finite. Start detailed diagnostics...", flush=True)
+    geo, model = unpack_params(theta, template_geo, template_model, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+
+    msgs = prior_violation_messages(geo, model, initial_model, prior, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+    if msgs:
+        print(f"[INIT-CHECK][PRIOR] FAILED with {len(msgs)} violation(s):", flush=True)
+        for msg in msgs[:80]:
+            print(f"[INIT-CHECK][PRIOR] {msg}", flush=True)
+        if len(msgs) > 80:
+            print(f"[INIT-CHECK][PRIOR] ... {len(msgs) - 80} more violations not printed", flush=True)
+        print("[INIT-CHECK] Stop diagnostics after prior failure; fix prior.dat or initial geo/vel first.", flush=True)
+        return
+    print("[INIT-CHECK][PRIOR] OK: initial parameters are inside prior bounds.", flush=True)
+
+    try:
+        validate_model(model)
+        print("[INIT-CHECK][MODEL] OK: VTI model passes physical/numerical checks.", flush=True)
+    except Exception as exc:
+        print(f"[INIT-CHECK][MODEL] FAILED: {type(exc).__name__}: {exc}", flush=True)
+        return
+
+    needed = tuple(like.waves)
+    try:
+        pmax_cache = _wave_pmax_cache(model, set(needed))
+        for ip, wave in [(1, "P"), (2, "SV"), (3, "SH")]:
+            if wave in needed:
+                pmax = pmax_cache[ip]
+                print(
+                    f"[INIT-CHECK][PMAX] {WAVES[ip]} pmax range=({np.min(pmax):.12e}, {np.max(pmax):.12e})",
+                    flush=True,
+                )
+    except Exception as exc:
+        print(f"[INIT-CHECK][PMAX] FAILED: {type(exc).__name__}: {exc}", flush=True)
+        return
+
+    tp = np.full((geo.ns, geo.nr), np.nan)
+    tsv = np.full((geo.ns, geo.nr), np.nan)
+    tsh = np.full((geo.ns, geo.nr), np.nan)
+    for isrc in range(geo.ns):
+        try:
+            tp_row, tsv_row, tsh_row = forward_direct_source(
+                geo, model, isrc,
+                stop=qx_stop, max_iter=qx_max_iter,
+                needed_waves=needed, pmax_cache=pmax_cache,
+            )
+            tp[isrc] = tp_row
+            tsv[isrc] = tsv_row
+            tsh[isrc] = tsh_row
+            parts = []
+            if "P" in needed:
+                parts.append(f"qP=({np.nanmin(tp_row):.6g},{np.nanmax(tp_row):.6g})")
+            if "SV" in needed:
+                parts.append(f"qSV=({np.nanmin(tsv_row):.6g},{np.nanmax(tsv_row):.6g})")
+            if "SH" in needed:
+                parts.append(f"qSH=({np.nanmin(tsh_row):.6g},{np.nanmax(tsh_row):.6g})")
+            print(f"[INIT-CHECK][FORWARD] source {isrc}: OK, " + ", ".join(parts), flush=True)
+        except Exception as exc:
+            print(
+                f"[INIT-CHECK][FORWARD] FAILED at source {isrc}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            print(
+                f"[INIT-CHECK][FORWARD] source coordinate: sx={geo.sx[isrc]:.12g}, sz={geo.sz[isrc]:.12g}",
+                flush=True,
+            )
+            return
+
+    pred = (tp, tsv, tsh)
+    mis = misfit_from_times(pred, obs, like)
+    print(f"[INIT-CHECK][MISFIT] recomputed misfit = {mis:.12g}", flush=True)
+    if not math.isfinite(mis):
+        print("[INIT-CHECK][MISFIT] FAILED: residual or covariance produced non-finite value.", flush=True)
+        if like.objective_type in {"diff-p-adjacent", "diff-p-reference"} and like.diff_matrix is not None:
+            pred_d = apply_difference(tp, like.diff_matrix)
+            res = pred_d - like.obs_d
+            print(
+                f"[INIT-CHECK][RESIDUAL] diff-P finite={np.all(np.isfinite(res))}, "
+                f"min={np.nanmin(res):.12g}, max={np.nanmax(res):.12g}",
+                flush=True,
+            )
+        elif like.objective_type == "absolute":
+            for wave, arr, obs_arr in [("P", tp, obs.tp), ("SV", tsv, obs.tsv), ("SH", tsh, obs.tsh)]:
+                if wave in needed:
+                    res = arr - obs_arr
+                    print(
+                        f"[INIT-CHECK][RESIDUAL] {wave} finite={np.all(np.isfinite(res))}, "
+                        f"min={np.nanmin(res):.12g}, max={np.nanmax(res):.12g}",
+                        flush=True,
+                    )
+    else:
+        print("[INIT-CHECK] Diagnostics did not reproduce the failure. Check for external file changes or rare numerical randomness.", flush=True)
+
+
+def selected_waves(use_waves: str) -> list[str]:
+    """Parse --use-waves into a clean list of wave labels."""
+    txt = use_waves.upper().replace(" ", "")
+    out = []
+    # Match whole labels, not arbitrary substrings.
+    labels = [x for x in txt.replace(";", ",").split(",") if x]
+    if not labels:
+        labels = [txt]
+    for lab in labels:
+        if lab in {"P", "QP"}:
+            out.append("P")
+        elif lab in {"SV", "QSV"}:
+            out.append("SV")
+        elif lab in {"SH", "QSH"}:
+            out.append("SH")
+    return out
+
+
+def difference_matrix(nr: int, mode: str) -> np.ndarray:
+    """Return A such that differential data d = A @ t for one source.
+
+    mode="adjacent":  d_i = t_i - t_{i+1}, i=0,...,nr-2.
+    mode="reference": d_i = t_{i+1} - t_0, i=0,...,nr-2.
+
+    Both choices produce nr-1 origin-time-free differences.  For
+    sigma_mode="absolute", differential errors are correlated and are handled
+    through C_d = sigma^2 A A^T.  The adjacent mode follows the manuscript
+    definition, Delta t_{r,r+1} = t_r - t_{r+1}.
+    """
+    nr = int(nr)
+    if nr < 2:
+        raise ValueError("Need at least two receivers for differential arrivals")
+    mode = mode.lower()
+    A = np.zeros((nr - 1, nr), dtype=float)
+    if mode == "adjacent":
+        for i in range(nr - 1):
+            A[i, i] = 1.0
+            A[i, i + 1] = -1.0
+        return A
+    if mode == "reference":
+        for i in range(nr - 1):
+            A[i, 0] = -1.0
+            A[i, i + 1] = 1.0
+        return A
+    raise ValueError(f"Unknown difference mode={mode!r}")
+
+
+def apply_difference(arr: np.ndarray, A: np.ndarray) -> np.ndarray:
+    """Apply d = A @ t to each source row of an ns x nr travel-time array.
+
+    The common adjacent-difference case is evaluated by slicing instead of a
+    dense matrix multiply.  This is mathematically identical to A @ t but much
+    faster for the field data (nr=488) and is also used by the grid-search code.
+    """
+    arr = np.asarray(arr, dtype=float)
+    if A is not None and A.ndim == 2 and A.shape[0] == arr.shape[1] - 1 and A.shape[1] == arr.shape[1]:
+        # adjacent: d_i = t_i - t_{i+1}
+        if A.shape[0] > 0 and A[0, 0] == 1.0 and A[0, 1] == -1.0 and A[-1, -2] == 1.0 and A[-1, -1] == -1.0:
+            return arr[:, :-1] - arr[:, 1:]
+        # reference: d_i = t_{i+1} - t_0
+        if A.shape[0] > 0 and A[0, 0] == -1.0 and A[0, 1] == 1.0 and A[-1, 0] == -1.0 and A[-1, -1] == 1.0:
+            return arr[:, 1:] - arr[:, :1]
+    return arr @ A.T
+
+
+def apply_difference_row(row: np.ndarray, A: np.ndarray) -> np.ndarray:
+    """One-source version of apply_difference()."""
+    row = np.asarray(row, dtype=float)
+    if A is not None and A.ndim == 2 and A.shape[0] == row.size - 1 and A.shape[1] == row.size:
+        if A.shape[0] > 0 and A[0, 0] == 1.0 and A[0, 1] == -1.0 and A[-1, -2] == 1.0 and A[-1, -1] == -1.0:
+            return row[:-1] - row[1:]
+        if A.shape[0] > 0 and A[0, 0] == -1.0 and A[0, 1] == 1.0 and A[-1, 0] == -1.0 and A[-1, -1] == 1.0:
+            return row[1:] - row[0]
+    return A @ row
+
+
+def build_likelihood_config(obs: ObsData, objective_type: str, use_waves: str,
+                            sigma_mode: str = "absolute") -> LikelihoodConfig:
+    """Precompute transformed observations and covariance terms for likelihood.
+
+    sigma_mode="absolute": obs.sigma is std of absolute arrival-time noise.
+        For differential objectives, C_d = sigma^2 A A^T.
+    sigma_mode="objective-iid": obs.sigma is std of the already transformed
+        objective residual, so differential residuals are treated as independent
+        with C_d = sigma^2 I.  Use this only if nobs.dat/sigma was generated
+        specifically for the differential objective.
+    """
+    sigma = float(obs.sigma)
+    if sigma <= 0.0 or not math.isfinite(sigma):
+        raise ValueError(f"Invalid noise sigma={sigma!r}")
+
+    objective_type = objective_type.lower()
+    sigma_mode = sigma_mode.lower()
+    if sigma_mode not in {"absolute", "objective-iid"}:
+        raise ValueError("sigma_mode must be 'absolute' or 'objective-iid'")
+
+    ns, nr = obs.tp.shape
+
+    if objective_type == "absolute":
+        waves = tuple(selected_waves(use_waves))
+        if not waves:
+            raise ValueError(f"No valid waves selected from use_waves={use_waves!r}")
+        return LikelihoodConfig(
+            objective_type=objective_type,
+            use_waves=use_waves,
+            sigma_abs=sigma,
+            sigma_mode=sigma_mode,
+            waves=waves,
+            diff_matrix=None,
+            cov_inv=None,
+            chol=None,
+            obs_d=None,
+            ndata_per_source=nr * len(waves),
+        )
+
+    if objective_type in {"diff-p-adjacent", "diff-p-reference"}:
+        mode = "adjacent" if objective_type == "diff-p-adjacent" else "reference"
+        A = difference_matrix(nr, mode)
+        obs_d = apply_difference(obs.tp, A)
+        if sigma_mode == "absolute":
+            cov = (sigma * sigma) * (A @ A.T)
+        else:
+            cov = (sigma * sigma) * np.eye(A.shape[0])
+        try:
+            L = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"Differential covariance is not positive definite for {objective_type}") from exc
+        # Dense inverse is acceptable for nr~O(10^2) and avoids solving a system
+        # for every source in every MCMC likelihood call.
+        cov_inv = np.linalg.solve(L.T, np.linalg.solve(L, np.eye(L.shape[0])))
+        return LikelihoodConfig(
+            objective_type=objective_type,
+            use_waves="P",
+            sigma_abs=sigma,
+            sigma_mode=sigma_mode,
+            waves=("P",),
+            diff_matrix=A,
+            cov_inv=cov_inv,
+            chol=L,
+            obs_d=obs_d,
+            ndata_per_source=A.shape[0],
+        )
+
+    raise ValueError(f"Unknown objective_type={objective_type!r}")
+
+def quadratic_form_inverse(residual: np.ndarray, cov_inv: np.ndarray) -> float:
+    """Return sum_s residual_s^T C^{-1} residual_s using cached inverse covariance."""
+    r = np.asarray(residual, dtype=float)
+    if np.any(~np.isfinite(r)):
+        return math.inf
+    return float(np.einsum("si,ij,sj->", r, cov_inv, r))
+
+
+def quadratic_form_inverse_by_source(residual: np.ndarray, cov_inv: np.ndarray) -> np.ndarray:
+    """Return one quadratic-form misfit value for each source row."""
+    r = np.asarray(residual, dtype=float)
+    if np.any(~np.isfinite(r)):
+        return np.full(r.shape[0], math.inf, dtype=float)
+    return np.einsum("si,ij,sj->s", r, cov_inv, r)
+
+
+def source_misfit_from_rows(tp_row: np.ndarray, tsv_row: np.ndarray, tsh_row: np.ndarray,
+                            isrc: int, obs: ObsData, like: LikelihoodConfig) -> float:
+    """Misfit contribution from one event/source.
+
+    This is mathematically identical to slicing the corresponding source from
+    misfit_from_times(), but avoids recomputing all other sources after an
+    sx[i]/sz[i] proposal.
+    """
+    sigma = float(like.sigma_abs)
+    if sigma <= 0.0 or not math.isfinite(sigma):
+        return math.inf
+    if like.objective_type == "absolute":
+        mis = 0.0
+        if "P" in like.waves:
+            r = tp_row - obs.tp[isrc, :]
+            if np.any(~np.isfinite(r)):
+                return math.inf
+            mis += float(np.sum((r / sigma) ** 2))
+        if "SV" in like.waves:
+            r = tsv_row - obs.tsv[isrc, :]
+            if np.any(~np.isfinite(r)):
+                return math.inf
+            mis += float(np.sum((r / sigma) ** 2))
+        if "SH" in like.waves:
+            r = tsh_row - obs.tsh[isrc, :]
+            if np.any(~np.isfinite(r)):
+                return math.inf
+            mis += float(np.sum((r / sigma) ** 2))
+        return mis
+
+    if like.objective_type in {"diff-p-adjacent", "diff-p-reference"}:
+        if like.diff_matrix is None or like.cov_inv is None or like.obs_d is None:
+            return math.inf
+        pred_d = apply_difference_row(tp_row, like.diff_matrix)
+        r = pred_d - like.obs_d[isrc, :]
+        if np.any(~np.isfinite(r)):
+            return math.inf
+        if like.sigma_mode == "objective-iid":
+            return float(np.sum((r / sigma) ** 2))
+        return float(r @ like.cov_inv @ r)
+
+    return math.inf
+
+
+def misfit_by_source_from_times(pred, obs: ObsData, like: LikelihoodConfig) -> np.ndarray:
+    """Return per-source likelihood misfit contributions."""
+    sigma = float(like.sigma_abs)
+    tp, tsv, tsh = pred
+    if sigma <= 0.0 or not math.isfinite(sigma):
+        return np.full(tp.shape[0], math.inf, dtype=float)
+
+    if like.objective_type == "absolute":
+        out = np.zeros(tp.shape[0], dtype=float)
+        if "P" in like.waves:
+            r = tp - obs.tp
+            if np.any(~np.isfinite(r)):
+                return np.full(tp.shape[0], math.inf, dtype=float)
+            out += np.sum((r / sigma) ** 2, axis=1)
+        if "SV" in like.waves:
+            r = tsv - obs.tsv
+            if np.any(~np.isfinite(r)):
+                return np.full(tp.shape[0], math.inf, dtype=float)
+            out += np.sum((r / sigma) ** 2, axis=1)
+        if "SH" in like.waves:
+            r = tsh - obs.tsh
+            if np.any(~np.isfinite(r)):
+                return np.full(tp.shape[0], math.inf, dtype=float)
+            out += np.sum((r / sigma) ** 2, axis=1)
+        return out
+
+    if like.objective_type in {"diff-p-adjacent", "diff-p-reference"}:
+        if like.diff_matrix is None or like.cov_inv is None or like.obs_d is None:
+            return np.full(tp.shape[0], math.inf, dtype=float)
+        pred_d = apply_difference(tp, like.diff_matrix)
+        r = pred_d - like.obs_d
+        if like.sigma_mode == "objective-iid":
+            if np.any(~np.isfinite(r)):
+                return np.full(tp.shape[0], math.inf, dtype=float)
+            return np.sum((r / sigma) ** 2, axis=1)
+        return quadratic_form_inverse_by_source(r, like.cov_inv)
+
+    return np.full(tp.shape[0], math.inf, dtype=float)
+
+
+def misfit_from_times(pred, obs: ObsData, like: LikelihoodConfig) -> float:
+    """Return the likelihood misfit r^T C^{-1} r, up to constants."""
+    by_source = misfit_by_source_from_times(pred, obs, like)
+    if np.any(~np.isfinite(by_source)):
+        return math.inf
+    return float(np.sum(by_source))
+
+
+def likelihood_covariance_diagnostics(obs: ObsData, like: LikelihoodConfig) -> str:
+    """Human-readable check of the covariance used in the likelihood."""
+    sigma = float(like.sigma_abs)
+    ns, nr = obs.tp.shape
+    objective_type = like.objective_type
+    if objective_type == "absolute":
+        nw = len(selected_waves(like.use_waves))
+        ndata = ns * nr * nw
+        return (
+            f"[LIKELIHOOD] objective=absolute, waves={like.use_waves}, sigma_abs={sigma:.6g}\n"
+            f"[LIKELIHOOD] covariance = sigma^2 I, ndata={ndata}, var={sigma*sigma:.6g}"
+        )
+
+    if objective_type in {"diff-p-adjacent", "diff-p-reference"}:
+        A = like.diff_matrix
+        L = like.chol
+        assert A is not None and L is not None
+        cov = L @ L.T
+        eig = np.linalg.eigvalsh(cov)
+        off = cov[0, 1] if cov.shape[0] > 1 else float("nan")
+        mode = "adjacent receiver-pair" if objective_type == "diff-p-adjacent" else "first-receiver reference-pair"
+        sign_text = "negative" if off < 0.0 else "positive"
+        ndata = ns * A.shape[0]
+        return (
+            f"[LIKELIHOOD] objective={objective_type}, qP {mode} differential arrivals, sigma={sigma:.6g}, sigma_mode={like.sigma_mode}\n"
+            f"[LIKELIHOOD] convention: sigma_mode=absolute gives C_d=sigma^2*A*A^T; sigma_mode=objective-iid gives C_d=sigma^2*I\n"
+            f"[LIKELIHOOD] per-source A shape={A.shape}, covariance shape={cov.shape}, ndata={ndata}\n"
+            f"[LIKELIHOOD] diag0={cov[0,0]:.6g}, offdiag01={off:.6g} ({sign_text}), eig_min={eig[0]:.6g}, eig_max={eig[-1]:.6g}, cond={eig[-1]/eig[0]:.6g}"
+        )
+    return f"[LIKELIHOOD] unknown objective={objective_type}"
+
+
+def objective(theta: np.ndarray, template_geo: Geometry, template_model: VTIModel,
+              initial_model: VTIModel, prior: Prior, obs: ObsData,
+              invert_depths: bool, fix_last_layer: bool,
+              qx_stop: float, qx_max_iter: int,
+              like: LikelihoodConfig,
+              fix_velocity: bool = False,
+              forward_executor: cf.ProcessPoolExecutor | None = None,
+              qx_init_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+              return_qx_cache: bool = False):
+    geo, model = unpack_params(theta, template_geo, template_model, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+    if not prior_ok(geo, model, initial_model, prior, invert_depths, fix_last_layer, fix_velocity=fix_velocity):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    try:
+        fwd = forward_direct(
+            geo, model, stop=qx_stop, max_iter=qx_max_iter,
+            needed_waves=like.waves, executor=forward_executor,
+            qx_init_cache=qx_init_cache, return_qx=return_qx_cache,
+        )
+        if return_qx_cache:
+            pred, qx_cache_new = fwd
+        else:
+            pred = fwd
+            qx_cache_new = None
+        mis_by_source = misfit_by_source_from_times(pred, obs, like)
+        if np.any(~np.isfinite(mis_by_source)):
+            if return_qx_cache:
+                return math.inf, None, None, None
+            return math.inf, None, None
+        mis = float(np.sum(mis_by_source))
+    except (FloatingPointError, ValueError, OverflowError):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    if not math.isfinite(mis):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    if return_qx_cache:
+        return mis, pred, mis_by_source, qx_cache_new
+    return mis, pred, mis_by_source
+
+
+def source_index_from_param_name(name: str) -> int | None:
+    """Return source index if a scalar parameter name is sx[i] or sz[i]."""
+    if not (name.startswith("sx[") or name.startswith("sz[")):
+        return None
+    try:
+        return int(name.split("[", 1)[1].split("]", 1)[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def parameter_has_no_forward_effect(name: str, like: LikelihoodConfig) -> bool:
+    """True when changing this scalar cannot change the selected travel times.
+
+    In the Christoffel implementation used here, gamma only affects qSH.  The
+    field inversion uses qP-only differential arrivals, so gamma proposals leave
+    the predicted qP times unchanged.  We still sample gamma from its prior, but
+    do not spend a full all-event forward calculation on it.
+    """
+    return name.startswith("gamma[") and "SH" not in set(like.waves)
+
+
+def objective_forward_invariant_update(theta: np.ndarray, current_pred, current_mis: float,
+                                       current_mis_by_source: np.ndarray,
+                                       template_geo: Geometry, template_model: VTIModel,
+                                       initial_model: VTIModel, prior: Prior,
+                                       invert_depths: bool, fix_last_layer: bool,
+                                       fix_velocity: bool = False):
+    geo, model = unpack_params(theta, template_geo, template_model, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+    if not prior_ok(geo, model, initial_model, prior, invert_depths, fix_last_layer, fix_velocity=fix_velocity):
+        return math.inf, None, None
+    return float(current_mis), current_pred, current_mis_by_source
+
+
+def objective_source_update(theta: np.ndarray,
+                            current_pred: Tuple[np.ndarray, np.ndarray, np.ndarray],
+                            current_mis_by_source: np.ndarray,
+                            current_mis: float,
+                            source_index: int,
+                            template_geo: Geometry, template_model: VTIModel,
+                            initial_model: VTIModel, prior: Prior, obs: ObsData,
+                            invert_depths: bool, fix_last_layer: bool,
+                            qx_stop: float, qx_max_iter: int,
+                            like: LikelihoodConfig,
+                            fix_velocity: bool = False,
+                            current_qx_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+                            return_qx_cache: bool = False):
+    """Objective for a proposal that changes only sx[source_index] or sz[source_index].
+
+    The VTI model and all other sources are unchanged.  Therefore both the
+    forward calculation and the likelihood update are done for only this source;
+    the total misfit is updated by replacing one per-source contribution.
+    This gives the same result as a full objective() call up to roundoff.
+    """
+    geo, model = unpack_params(theta, template_geo, template_model, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+    if not prior_ok(geo, model, initial_model, prior, invert_depths, fix_last_layer, fix_velocity=fix_velocity):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    try:
+        validate_model(model)
+        needed = set(like.waves)
+        pmax_cache = _wave_pmax_cache(model, needed)
+        qx_init_rows = None
+        if current_qx_cache is not None:
+            qx_init_rows = tuple(arr[source_index, :].copy() for arr in current_qx_cache)
+        out = forward_direct_source(
+            geo, model, source_index,
+            stop=qx_stop, max_iter=qx_max_iter,
+            needed_waves=tuple(needed),
+            pmax_cache=pmax_cache,
+            qx_init_rows=qx_init_rows,
+            return_qx=return_qx_cache,
+        )
+        if return_qx_cache:
+            row_pred, row_qx = out
+        else:
+            row_pred = out
+            row_qx = None
+        row_mis = source_misfit_from_rows(row_pred[0], row_pred[1], row_pred[2], source_index, obs, like)
+        if not math.isfinite(row_mis):
+            if return_qx_cache:
+                return math.inf, None, None, None
+            return math.inf, None, None
+
+        tp, tsv, tsh = (arr.copy() for arr in current_pred)
+        if "P" in needed:
+            tp[source_index, :] = row_pred[0]
+        if "SV" in needed:
+            tsv[source_index, :] = row_pred[1]
+        if "SH" in needed:
+            tsh[source_index, :] = row_pred[2]
+        pred = (tp, tsv, tsh)
+        qx_cache_new = None
+        if return_qx_cache:
+            if current_qx_cache is None:
+                qx_cache_new = (np.full_like(tp, np.nan), np.full_like(tsv, np.nan), np.full_like(tsh, np.nan))
+            else:
+                qx_cache_new = tuple(arr.copy() for arr in current_qx_cache)
+            if "P" in needed:
+                qx_cache_new[0][source_index, :] = row_qx[0]
+            if "SV" in needed:
+                qx_cache_new[1][source_index, :] = row_qx[1]
+            if "SH" in needed:
+                qx_cache_new[2][source_index, :] = row_qx[2]
+        mis_by_source = np.asarray(current_mis_by_source, dtype=float).copy()
+        old_row_mis = float(mis_by_source[source_index])
+        mis_by_source[source_index] = float(row_mis)
+        mis = float(current_mis - old_row_mis + row_mis)
+    except (FloatingPointError, ValueError, OverflowError, IndexError):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    if not math.isfinite(mis):
+        if return_qx_cache:
+            return math.inf, None, None, None
+        return math.inf, None, None
+    if return_qx_cache:
+        return mis, pred, mis_by_source, qx_cache_new
+    return mis, pred, mis_by_source
+
+
+# =============================================================================
+# MCMC driver
+# =============================================================================
+
+def normal_logpdf_scalar(x: float, mean: float, std: float) -> float:
+    """Log density of N(mean, std^2) for one scalar value."""
+    std = max(float(std), 1e-300)
+    r = (float(x) - float(mean)) / std
+    return -0.5 * r * r - math.log(std) - 0.5 * math.log(2.0 * math.pi)
+
+
+def log_one_minus_accept(log_alpha: float) -> float:
+    """Return log(1 - min(1, exp(log_alpha))) stably."""
+    if not math.isfinite(log_alpha):
+        return 0.0 if log_alpha < 0.0 else -math.inf
+    if log_alpha >= 0.0:
+        return -math.inf
+    # log(1-exp(log_alpha)), where log_alpha < 0
+    return math.log1p(-math.exp(log_alpha))
+
+
+def scalar_param_index(it: int, ndim: int, rng: np.random.Generator, update_order: str) -> int:
+    """Choose exactly one scalar parameter for this MCMC update."""
+    if update_order.lower() == "random":
+        return int(rng.integers(0, ndim))
+    # cyclic traversal: 0, 1, ..., ndim-1, 0, ...
+    return int(it % ndim)
+
+
+def update_adaptive_scalar_std(chain: np.ndarray, base_std: np.ndarray, current_std: np.ndarray,
+                               it: int, adapt_scale: float, min_scale: float, max_scale: float) -> np.ndarray:
+    """Component-wise adaptive proposal std from empirical marginal chain variance."""
+    hist = chain[:it]
+    if hist.shape[0] < 20:
+        return current_std
+    empirical_std = np.std(hist, axis=0, ddof=1)
+    new_std = current_std.copy()
+    finite = np.isfinite(empirical_std) & (empirical_std > 0.0)
+    new_std[finite] = adapt_scale * empirical_std[finite]
+
+    floor = np.maximum(np.abs(base_std) * min_scale, 1e-12)
+    ceil = np.maximum(np.abs(base_std) * max_scale, floor * 10.0)
+    new_std = np.minimum(np.maximum(new_std, floor), ceil)
+    new_std[~np.isfinite(new_std)] = current_std[~np.isfinite(new_std)]
+    return new_std
+
+
+
+def _layer_step_xy(depth: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return x/y arrays for a simple layered step plot versus depth."""
+    dep = np.asarray(depth, dtype=float)
+    val = np.asarray(values, dtype=float)
+    if dep.size == 0:
+        return val, dep
+    if dep.size >= 2:
+        dz = np.diff(dep)
+        dz = dz[np.isfinite(dz) & (dz > 0.0)]
+        last_thick = float(np.median(dz)) if dz.size else 50.0
+    else:
+        last_thick = 50.0
+    dep_ext = np.r_[dep, dep[-1] + last_thick]
+    val_ext = np.r_[val, val[-1]]
+    return val_ext, dep_ext
+
+
+def _layer_profile_xy_skip_first_horizontal(depth: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return polyline x/y arrays for a layered profile without a top horizontal segment.
+
+    This draws the first layer as a vertical segment only, then uses horizontal
+    connectors at each deeper interface.  It matches the user's preferred style
+    for the initial velocity-model check figure.
+    """
+    dep = np.asarray(depth, dtype=float)
+    val = np.asarray(values, dtype=float)
+    if dep.size == 0 or val.size == 0:
+        return val, dep
+    if dep.size >= 2:
+        dz = np.diff(dep)
+        dz = dz[np.isfinite(dz) & (dz > 0.0)]
+        last_thick = float(np.median(dz)) if dz.size else 50.0
+    else:
+        last_thick = 50.0
+    dep_ext = np.r_[dep, dep[-1] + last_thick]
+
+    xs = [val[0], val[0]]
+    ys = [dep_ext[0], dep_ext[1]]
+    for i in range(1, val.size):
+        xs.extend([val[i - 1], val[i]])
+        ys.extend([dep_ext[i], dep_ext[i]])
+        xs.extend([val[i], val[i]])
+        ys.extend([dep_ext[i], dep_ext[i + 1]])
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+
+
+def plot_input_diagnostics(output_dir: Path, geo: Geometry, model: VTIModel, obs: ObsData,
+                           like: LikelihoodConfig, prior: Prior) -> None:
+    """Write field-input check figures after reading geometry/vel/nobs files.
+
+    The input_check directory contains PDFs only.  The P-data PDF is a
+    multi-page file: one page per event, with absolute P arrival times and the
+    adjacent-station differential times used by the objective.
+    """
+    if plt is None:
+        print("[PLOT][WARN] matplotlib is unavailable; skip input diagnostic figures", flush=True)
+        return
+
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    plt.rcParams.update({
+        "font.family": "Times New Roman",
+        "mathtext.fontset": "custom",
+        "mathtext.rm": "Times New Roman",
+        "axes.unicode_minus": False,
+    })
+
+    fig_dir = output_dir / "input_check"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    for old_png in fig_dir.glob("*.png"):
+        try:
+            old_png.unlink()
+        except Exception:
+            pass
+
+    # 1) Velocity model: five VTI parameters for all fixed depth nodes/layers.
+    params = [
+        ("Vp / alpha0 (m/s)", model.alpha, "red"),
+        ("Vs / beta0 (m/s)", model.beta, "red"),
+        ("epsilon", model.epsilon, "red"),
+        ("gamma", model.gamma, "red"),
+        ("delta", model.delta, "red"),
+    ]
+    fig, axes = plt.subplots(1, 5, figsize=(15.0, 5.4), sharey=True)
+    for ax, (label, arr, color) in zip(axes, params):
+        xx, zz = _layer_profile_xy_skip_first_horizontal(model.dep, arr)
+        ax.plot(xx, zz, linewidth=2.8, color=color)
+        ax.set_xlabel(label)
+        ax.grid(True, alpha=0.25)
+        ax.set_ylim(2000.0, 200.0)
+    axes[0].set_ylabel("Depth (m)")
+    fig.suptitle(f"MCMC input velocity model: nlayer={model.nlayer}")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "input_velocity_model.pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # 2) Geometry: receiver order and event prior box.  Source markers are
+    # shown only after a full geo.dat with grid-search source coordinates exists.
+    fig, ax = plt.subplots(figsize=(7.8, 6.2))
+    ax.plot(geo.rx, geo.rz, "-", linewidth=1.0, alpha=0.65, color="black", label="DAS receiver order")
+    ax.scatter(geo.rx, geo.rz, s=12, color="black", label="DAS receivers")
+    valid_src = np.isfinite(geo.sx) & np.isfinite(geo.sz)
+    if np.any(valid_src):
+        ax.scatter(
+            geo.sx[valid_src], geo.sz[valid_src],
+            s=28, marker="o", facecolors="none", edgecolors="red",
+            linewidths=1.2, label="Initial events from grid search",
+        )
+    # Prior rectangle.
+    x0, x1 = float(prior.hmin), float(prior.hmax)
+    z0, z1 = float(prior.zmin), float(prior.zmax)
+    ax.plot([x0, x1, x1, x0, x0], [z0, z0, z1, z1, z0], "--", color="red", linewidth=1.8, label="Event uniform prior")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Depth (m)")
+    xmin = min(float(np.nanmin(geo.rx)), x0) - 50.0
+    xmax = max(float(np.nanmax(geo.rx)), x1) + 50.0
+    if np.any(valid_src):
+        xmin = min(xmin, float(np.nanmin(geo.sx[valid_src])) - 50.0)
+        xmax = max(xmax, float(np.nanmax(geo.sx[valid_src])) + 50.0)
+    zmin = min(float(np.nanmin(geo.rz)), z0, 200.0) - 50.0
+    zmax = max(float(np.nanmax(geo.rz)), z1, 2000.0) + 50.0
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(zmax, zmin)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    ax.set_title("MCMC input 2-D geometry check")
+    fig.tight_layout()
+    fig.savefig(fig_dir / "input_geometry.pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # 3) Observed P data and the actual differential data used by the objective.
+    if like.diff_matrix is not None:
+        data_d = apply_difference(obs.tp, like.diff_matrix)
+        diff_label = "Adjacent P differential time"
+        diff_ylabel = "Time difference (s)"
+        diff_xlabel = "Receiver-pair index"
+    else:
+        data_d = obs.tp
+        diff_label = "P data used by objective"
+        diff_ylabel = "Time (s)"
+        diff_xlabel = "Receiver index"
+
+    with PdfPages(fig_dir / "input_p_data.pdf") as pdf:
+        for isrc in range(obs.tp.shape[0]):
+            fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.6))
+
+            ir = np.arange(obs.tp.shape[1], dtype=int)
+            axes[0].plot(ir, obs.tp[isrc, :], color="black", linewidth=1.4)
+            axes[0].set_title(f"Event {isrc + 1}: observed P arrival time")
+            axes[0].set_xlabel("Receiver index")
+            axes[0].set_ylabel("Time (s)")
+            axes[0].grid(True, alpha=0.25)
+            axes[0].invert_yaxis()
+
+            idiff = np.arange(data_d.shape[1], dtype=int)
+            axes[1].plot(idiff, data_d[isrc, :], color="red", linewidth=1.4)
+            axes[1].set_title(f"Event {isrc + 1}: {diff_label}")
+            axes[1].set_xlabel(diff_xlabel)
+            axes[1].set_ylabel(diff_ylabel)
+            axes[1].grid(True, alpha=0.25)
+
+            fig.suptitle(f"MCMC input data check: event {isrc + 1}/{obs.tp.shape[0]}, nr={geo.nr}, sigma={obs.sigma:g} s")
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"[PLOT] wrote input diagnostic PDFs to {fig_dir}", flush=True)
+
+def run_mcmc(input_dir: Path, output_dir: Path, iterations: int, burnin: int,
+             seed: int, use_waves: str, qx_stop: float, qx_max_iter: int,
+             objective_type: str, sigma_mode: str,
+             invert_depths: bool, fix_last_layer: bool, fix_velocity: bool,
+             check_nobs_geometry: bool, check_nobs_source_geometry: bool, geometry_tol: float,
+             adapt_start: int, adapt_interval: int, adapt_stop: int, print_every: int,
+             dr_scale: float, update_order: str, forward_workers: int,
+             adapt_scale: float, min_std_scale: float, max_std_scale: float) -> Dict[str, np.ndarray]:
+    """Run component-wise DRAM.
+
+    One MCMC iteration updates exactly one scalar parameter:
+        dep[k] or alpha/beta/epsilon/gamma/delta[k] or sx[i] or sz[i].
+
+    DRAM details used here:
+        1. first-stage scalar random-walk proposal with adaptive std;
+        2. if rejected, delayed-rejection second-stage proposal with smaller std;
+        3. component-wise adaptive proposal std estimated from the marginal chain.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print("[VERSION] field VTI joint MCMC with input diagnostics + uniform priors", flush=True)
+
+    geo0 = read_geometry(input_dir / "geo.dat")
+    model0 = read_model(input_dir / "vel.dat")
+    obs = read_observed(input_dir / "nobs.dat")
+    prior = read_prior(input_dir / "prior.dat")
+    prop = read_proposal(input_dir / "prop.dat")
+
+    if check_nobs_geometry:
+        validate_observed_geometry(geo0, obs, tol=geometry_tol, check_sources=check_nobs_source_geometry)
+    elif obs.tp.shape != (geo0.ns, geo0.nr):
+        raise ValueError("Observed data shape does not match geo.dat geometry")
+    check_receiver_order_for_differences(geo0, objective_type)
+
+    rng = np.random.default_rng(seed)
+    theta = pack_params(geo0, model0, invert_depths=invert_depths, fix_last_layer=fix_last_layer, fix_velocity=fix_velocity)
+    base_std = proposal_std_vector(model0, geo0, prop, invert_depths=invert_depths, fix_last_layer=fix_last_layer, fix_velocity=fix_velocity)
+    scalar_std = base_std.copy()
+    ndim = theta.size
+    names = param_names(model0, geo0, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+
+    like = build_likelihood_config(obs, objective_type, use_waves, sigma_mode=sigma_mode)
+    print(likelihood_covariance_diagnostics(obs, like), flush=True)
+    plot_input_diagnostics(output_dir, geo0, model0, obs, like, prior)
+
+    forward_workers = int(forward_workers)
+    if forward_workers <= 0:
+        forward_workers = max(1, min(geo0.ns, (os.cpu_count() or 1)))
+    forward_workers = max(1, min(forward_workers, geo0.ns))
+    forward_executor = cf.ProcessPoolExecutor(max_workers=forward_workers) if forward_workers > 1 else None
+
+    mis, pred, mis_by_source, qx_cache = objective(
+        theta, geo0, model0, model0, prior, obs, invert_depths, fix_last_layer,
+        qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+        forward_executor=forward_executor, return_qx_cache=True,
+    )
+    if not math.isfinite(mis):
+        print_initial_objective_diagnostics(
+            theta, geo0, model0, model0, prior, obs,
+            invert_depths, fix_last_layer, qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+        )
+        if forward_executor is not None:
+            forward_executor.shutdown(wait=True, cancel_futures=True)
+        raise RuntimeError("Initial model is outside prior bounds or gives invalid forward travel times; see [INIT-CHECK] diagnostics above")
+
+    chain = np.zeros((iterations, ndim), dtype=float)
+    misfits = np.zeros(iterations, dtype=float)
+    accepted = np.zeros(iterations, dtype=bool)
+    accepted_stage = np.zeros(iterations, dtype=np.int8)  # 0 rejected, 1 first-stage, 2 delayed stage
+    updated_index = np.zeros(iterations, dtype=np.int32)
+
+    tried_1 = np.zeros(ndim, dtype=int)
+    acc_1 = np.zeros(ndim, dtype=int)
+    tried_2 = np.zeros(ndim, dtype=int)
+    acc_2 = np.zeros(ndim, dtype=int)
+
+    best_mis = mis
+    best_iter = 0
+
+    n_source_params = sum(source_index_from_param_name(nm) is not None for nm in names)
+    n_global_params = ndim - n_source_params
+    source_param_prob = 100.0 * n_source_params / max(ndim, 1)
+    global_param_prob = 100.0 * n_global_params / max(ndim, 1)
+    full_forward_trials = 0
+    source_forward_trials = 0
+    no_forward_trials = 0
+
+    print(f"[START] ns={geo0.ns}, nr={geo0.nr}, nlayer={model0.nlayer}, ndim={ndim}, initial misfit={mis:.6g}", flush=True)
+    print(
+        f"[DRAM] iterations={iterations}, objective={objective_type}, use_waves={use_waves}, qx_stop={qx_stop}, "
+        f"qx_max_iter={qx_max_iter}, print_every={print_every}",
+        flush=True,
+    )
+    print(
+        f"[DRAM] scalar update: update_order={update_order}, dr_scale={dr_scale:g}, "
+        f"adapt_start={adapt_start}, adapt_interval={adapt_interval}",
+        flush=True,
+    )
+    print(
+        f"[DRAM] update blocks: source-location params={n_source_params}/{ndim} "
+        f"({source_param_prob:.2f}%, one-event forward); "
+        f"global velocity/depth params={n_global_params}/{ndim} "
+        f"({global_param_prob:.2f}%, all-event forward)",
+        flush=True,
+    )
+    print(
+        f"[DRAM] full-forward event parallelism: workers={forward_workers}; "
+        "global velocity/depth proposals recompute all events in parallel; "
+        "source-location proposals still recompute only one event",
+        flush=True,
+    )
+    print(
+        f"[DRAM] qx warm start: enabled; numba core: {'enabled' if _NUMBA_AVAILABLE else 'disabled'}",
+        flush=True,
+    )
+
+    if adapt_stop <= 0:
+        # By default, freeze adaptation at burn-in so posterior samples after
+        # burn-in are generated with a fixed proposal kernel.
+        adapt_stop = burnin
+    print(f"[DRAM] adaptation active for iterations ({adapt_start}, {adapt_stop}); set --adapt-stop 0? no, 0 means burnin", flush=True)
+
+    block_start_time = time.perf_counter()
+
+    for it in range(iterations):
+        if it > adapt_start and it < adapt_stop and adapt_interval > 0 and it % adapt_interval == 0:
+            scalar_std = update_adaptive_scalar_std(
+                chain=chain, base_std=base_std, current_std=scalar_std,
+                it=it, adapt_scale=adapt_scale,
+                min_scale=min_std_scale, max_scale=max_std_scale,
+            )
+
+        j = scalar_param_index(it, ndim, rng, update_order)
+        updated_index[it] = j
+        src_update_index = source_index_from_param_name(names[j])
+        sigma1 = float(max(scalar_std[j], 1e-12))
+        sigma2 = float(max(dr_scale * sigma1, 1e-12))
+
+        # ---------------- First-stage Metropolis proposal ----------------
+        tried_1[j] += 1
+        theta1 = theta.copy()
+        theta1[j] += rng.normal(0.0, sigma1)
+        if parameter_has_no_forward_effect(names[j], like) and pred is not None and mis_by_source is not None:
+            no_forward_trials += 1
+            mis1, pred1, mis_by_source1 = objective_forward_invariant_update(
+                theta1, pred, mis, mis_by_source, geo0, model0, model0, prior,
+                invert_depths, fix_last_layer, fix_velocity=fix_velocity,
+            )
+            qx_cache1 = qx_cache
+        elif src_update_index is not None and pred is not None and mis_by_source is not None:
+            source_forward_trials += 1
+            mis1, pred1, mis_by_source1, qx_cache1 = objective_source_update(
+                theta1, pred, mis_by_source, mis, src_update_index, geo0, model0, model0, prior, obs,
+                invert_depths, fix_last_layer, qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+                current_qx_cache=qx_cache, return_qx_cache=True,
+            )
+        else:
+            full_forward_trials += 1
+            mis1, pred1, mis_by_source1, qx_cache1 = objective(
+                theta1, geo0, model0, model0, prior, obs,
+                invert_depths, fix_last_layer,
+                qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+                forward_executor=forward_executor, qx_init_cache=qx_cache, return_qx_cache=True,
+            )
+        log_alpha1 = -0.5 * (mis1 - mis)
+
+        accepted_now = False
+        stage = 0
+        if math.isfinite(log_alpha1) and math.log(rng.random()) < min(0.0, log_alpha1):
+            theta = theta1
+            mis = mis1
+            pred = pred1
+            mis_by_source = mis_by_source1
+            qx_cache = qx_cache1
+            accepted_now = True
+            stage = 1
+            acc_1[j] += 1
+        else:
+            # ---------------- Delayed-rejection second-stage proposal ----------------
+            # If the first scalar proposal is rejected, try a smaller step for the same parameter.
+            tried_2[j] += 1
+            theta2 = theta.copy()
+            theta2[j] += rng.normal(0.0, sigma2)
+            if parameter_has_no_forward_effect(names[j], like) and pred is not None and mis_by_source is not None:
+                no_forward_trials += 1
+                mis2, pred2, mis_by_source2 = objective_forward_invariant_update(
+                    theta2, pred, mis, mis_by_source, geo0, model0, model0, prior,
+                    invert_depths, fix_last_layer, fix_velocity=fix_velocity,
+                )
+                qx_cache2 = qx_cache
+            elif src_update_index is not None and pred is not None and mis_by_source is not None:
+                source_forward_trials += 1
+                mis2, pred2, mis_by_source2, qx_cache2 = objective_source_update(
+                    theta2, pred, mis_by_source, mis, src_update_index, geo0, model0, model0, prior, obs,
+                    invert_depths, fix_last_layer, qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+                    current_qx_cache=qx_cache, return_qx_cache=True,
+                )
+            else:
+                full_forward_trials += 1
+                mis2, pred2, mis_by_source2, qx_cache2 = objective(
+                    theta2, geo0, model0, model0, prior, obs,
+                    invert_depths, fix_last_layer,
+                    qx_stop, qx_max_iter, like, fix_velocity=fix_velocity,
+                    forward_executor=forward_executor, qx_init_cache=qx_cache, return_qx_cache=True,
+                )
+
+            if math.isfinite(mis2):
+                # Strict two-stage delayed-rejection correction for symmetric random-walk q2.
+                # pi(theta) ∝ exp(-0.5 * misfit). q1 is scalar Gaussian with std=sigma1.
+                log_pi_x = -0.5 * mis
+                log_pi_y = -0.5 * mis1
+                log_pi_z = -0.5 * mis2
+
+                xj = float(theta[j])
+                yj = float(theta1[j])
+                zj = float(theta2[j])
+
+                log_q1_x_to_y = normal_logpdf_scalar(yj, xj, sigma1)
+                log_q1_z_to_y = normal_logpdf_scalar(yj, zj, sigma1)
+
+                # alpha1(x, y) and alpha1(z, y)
+                log_a1_xy = log_pi_y - log_pi_x
+                log_a1_zy = log_pi_y - log_pi_z
+
+                log_num = log_pi_z + log_q1_z_to_y + log_one_minus_accept(log_a1_zy)
+                log_den = log_pi_x + log_q1_x_to_y + log_one_minus_accept(log_a1_xy)
+                log_alpha2 = log_num - log_den
+
+                if math.isfinite(log_alpha2) and math.log(rng.random()) < min(0.0, log_alpha2):
+                    theta = theta2
+                    mis = mis2
+                    pred = pred2
+                    mis_by_source = mis_by_source2
+                    qx_cache = qx_cache2
+                    accepted_now = True
+                    stage = 2
+                    acc_2[j] += 1
+
+        accepted[it] = accepted_now
+        accepted_stage[it] = stage
+
+        if mis < best_mis:
+            best_mis = mis
+            best_iter = it + 1
+
+        chain[it] = theta
+        misfits[it] = mis
+
+        if print_every > 0 and (it + 1) % print_every == 0:
+            acc_rate = 100.0 * np.mean(accepted[:it + 1])
+            acc1_rate = 100.0 * np.sum(accepted_stage[:it + 1] == 1) / (it + 1)
+            acc2_rate = 100.0 * np.sum(accepted_stage[:it + 1] == 2) / (it + 1)
+            accepted_flag = "N" if stage == 0 else f"Y{stage}"
+            block_elapsed = time.perf_counter() - block_start_time
+            block_start_time = time.perf_counter()
+            print(
+                f"[ITER {it + 1:>7d}/{iterations}] "
+                f"misfit={mis:.6g}, "
+                f"param={j}:{names[j]}, std={sigma1:.3g}, "
+                f"accepted={accepted_flag}, "
+                f"stage1={acc1_rate:.2f}%, stage2={acc2_rate:.2f}%, "
+                f"acc={acc_rate:.2f}%, "
+                f"source_fw={source_forward_trials}, full_fw={full_forward_trials}, no_fw={no_forward_trials}, "
+                f"block_time={block_elapsed:.2f}s",
+                flush=True,
+            )
+
+    # Burn-in is now a fixed iteration count: use samples after the first `burnin` iterations.
+    # Default is 10000, so mean.dat is computed from chain[10000:].
+    burnin = int(max(0, burnin))
+    if burnin >= iterations:
+        print(
+            f"[WARN] burnin={burnin} >= iterations={iterations}; "
+            "using the full chain for posterior mean/std instead.",
+            flush=True,
+        )
+        burnin_eff = 0
+    else:
+        burnin_eff = burnin
+    samples = chain[burnin_eff:]
+    mean_theta = np.mean(samples, axis=0)
+    std_theta = np.std(samples, axis=0, ddof=1) if samples.shape[0] > 1 else np.zeros(ndim)
+    best_idx = int(np.argmin(misfits))
+    best_theta = chain[best_idx]
+
+    mean_geo, mean_model = unpack_params(mean_theta, geo0, model0, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+    best_geo, best_model = unpack_params(best_theta, geo0, model0, invert_depths, fix_last_layer, fix_velocity=fix_velocity)
+
+    np.savez(
+        output_dir / "chain.npz",
+        chain=chain, misfit=misfits, accepted=accepted, accepted_stage=accepted_stage,
+        updated_index=updated_index,
+        final_scalar_std=scalar_std, base_scalar_std=base_std,
+        tried_stage1=tried_1, accepted_stage1_by_param=acc_1,
+        tried_stage2=tried_2, accepted_stage2_by_param=acc_2,
+        mean_theta=mean_theta, std_theta=std_theta, best_theta=best_theta,
+        burnin=burnin, burnin_eff=burnin_eff,
+        objective_type=np.asarray(objective_type),
+        sigma_mode=np.asarray(sigma_mode),
+        adapt_stop=np.asarray(adapt_stop),
+        fix_velocity=np.asarray(bool(fix_velocity)),
+        param_names=np.asarray(names),
+    )
+    write_model_summary(output_dir / "mean.dat", mean_model, mean_geo, float(np.mean(misfits[burnin_eff:])))
+    write_model_summary(output_dir / "best.dat", best_model, best_geo, float(misfits[best_idx]))
+
+    if plt is not None:
+        fig = plt.figure(figsize=(8, 4))
+        plt.plot(np.arange(1, iterations + 1), misfits, marker=".", linewidth=0.8)
+        plt.xlabel("Iteration")
+        plt.ylabel("Misfit")
+        plt.tight_layout()
+        fig.savefig(output_dir / "misfit.png", dpi=300)
+        plt.close(fig)
+
+    print(f"[DONE] best misfit={misfits[best_idx]:.6g} at iteration {best_idx + 1}", flush=True)
+    print(f"[DONE] burnin={burnin} (effective start index={burnin_eff}); posterior samples={samples.shape[0]}", flush=True)
+    print(f"[DONE] total acceptance={100.0 * np.mean(accepted):.2f}%", flush=True)
+    print(f"[DONE] output saved to {output_dir}", flush=True)
+    if forward_executor is not None:
+        forward_executor.shutdown(wait=True, cancel_futures=True)
+
+    return {
+        "chain": chain,
+        "misfit": misfits,
+        "accepted": accepted,
+        "accepted_stage": accepted_stage,
+        "updated_index": updated_index,
+        "mean_theta": mean_theta,
+        "std_theta": std_theta,
+        "best_theta": best_theta,
+    }
+
+def param_names(model: VTIModel, geo: Geometry, invert_depths: bool, fix_last_layer: bool,
+                fix_velocity: bool = False) -> list[str]:
+    layers = active_layer_indices(model, fix_last_layer)
+    names = []
+    if fix_velocity:
+        names.extend([f"sx[{i}]" for i in range(geo.ns)])
+        names.extend([f"sz[{i}]" for i in range(geo.ns)])
+        return names
+    if invert_depths:
+        depth_idx = active_depth_indices(model)
+        names.extend([f"dep[{k}]" for k in depth_idx])
+    for name in ["alpha", "beta", "epsilon", "gamma", "delta"]:
+        names.extend([f"{name}[{k}]" for k in layers])
+    names.extend([f"sx[{i}]" for i in range(geo.ns)])
+    names.extend([f"sz[{i}]" for i in range(geo.ns)])
+    return names
+
+
+def write_model_summary(path: Path, model: VTIModel, geo: Geometry, misfit: float) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"# misfit\n{misfit:.12g}\n")
+        f.write(f"# nlayer\n{model.nlayer:d}\n")
+        f.write("# dep alpha beta epsilon gamma delta\n")
+        for k in range(model.nlayer):
+            f.write(
+                f"{model.dep[k]:.10f}\t{model.alpha[k]:.10f}\t{model.beta[k]:.10f}\t"
+                f"{model.epsilon[k]:.10f}\t{model.gamma[k]:.10f}\t{model.delta[k]:.10f}\n"
+            )
+        f.write(f"# ns\n{geo.ns:d}\n")
+        f.write("# sx sz\n")
+        for i in range(geo.ns):
+            f.write(f"{geo.sx[i]:.10f}\t{geo.sz[i]:.10f}\n")
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Joint MCMC inversion of layered VTI parameters and source locations")
+    p.add_argument("--input-dir", default="../01-initial/output", type=Path)
+    p.add_argument("--output-dir", default="../03-output/output", type=Path)
+    p.add_argument("--iterations", type=int, default=50000)
+    p.add_argument("--burnin", type=int, default=10000, help="Discard samples before this iteration when computing mean/std; default=10000")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--use-waves", default="P,SV,SH", help="Combination of P, SV, SH; used only by --objective absolute")
+    p.add_argument("--sigma-mode", choices=["absolute", "objective-iid"], default="absolute",
+                   help="Noise interpretation. absolute: sigma is original absolute-arrival std; objective-iid: sigma is iid std after applying the chosen objective.")
+    p.add_argument("--geometry-tol", type=float, default=1e-8,
+                   help="Tolerance for checking sx/sz/rx/rz columns in nobs.dat against geo.dat; default=1e-8.")
+    p.add_argument("--no-check-nobs-geometry", dest="check_nobs_geometry", action="store_false",
+                   help="Disable nobs.dat-vs-geo.dat receiver geometry consistency check. Not recommended.")
+    p.add_argument("--check-nobs-source-geometry", action="store_true",
+                   help="Also require source coordinates in nobs.dat to match geo.dat. Usually leave this OFF when source locations are inverted, because geo.dat often contains only initial source guesses.")
+    p.set_defaults(check_nobs_geometry=True, check_nobs_source_geometry=False)
+    p.add_argument(
+        "--objective",
+        choices=["diff-p-adjacent", "diff-p-reference", "absolute"],
+        default="diff-p-adjacent",
+        help="Likelihood target. diff-p-adjacent uses qP t[i]-t[i+1], matching the manuscript station-pair definition; diff-p-reference uses qP t[i+1]-t[0]. Both use the induced non-diagonal covariance.",
+    )
+    p.add_argument("--qx-stop", type=float, default=None,
+                   help="qx solver stop tolerance. Default: read ../01-initial/output/control.dat, fallback DEFAULT_STOP.")
+    p.add_argument("--qx-max-iter", type=int, default=None,
+                   help="qx solver max iterations. Default: read ../01-initial/output/control.dat, fallback DEFAULT_MAX_ITER.")
+    depth_group = p.add_mutually_exclusive_group()
+    depth_group.add_argument(
+        "--invert-depths",
+        dest="invert_depths",
+        action="store_true",
+        help="Invert internal layer-interface depths dep[1:nlayer-1]; keep dep[0] and dep[-1] fixed (default)",
+    )
+    depth_group.add_argument(
+        "--no-invert-depths",
+        dest="invert_depths",
+        action="store_false",
+        help="Keep layer-interface depths fixed",
+    )
+    p.set_defaults(invert_depths=True)
+    p.add_argument("--fix-last-layer", action="store_true", help="Keep last half-space VTI parameters fixed")
+    p.add_argument("--fix-velocity", action="store_true",
+                   help="Keep all velocity/depth parameters fixed and invert only source sx/sz. Recommended for field P-only data or when using a supplied velocity model.")
+    p.add_argument("--adapt-start", type=int, default=5000, help="Start adapting scalar proposal std after this iteration")
+    p.add_argument("--adapt-interval", type=int, default=1000, help="Adapt scalar proposal std every N iterations; 0 disables adaptation")
+    p.add_argument("--adapt-stop", type=int, default=0, help="Stop adapting before this iteration. Default 0 means stop at burnin, preserving fixed-kernel posterior sampling after burnin.")
+    p.add_argument("--print-every", type=int, default=100, help="Print MCMC progress every N iterations; 0 disables progress output")
+    p.add_argument("--dr-scale", type=float, default=0.2, help="Second-stage delayed-rejection proposal std = dr_scale * first-stage std")
+    p.add_argument("--update-order", choices=["cyclic", "random"], default="random", help="Choose one scalar parameter cyclically or randomly each iteration")
+    p.add_argument("--forward-workers", type=int, default=1,
+                   help="Number of parallel workers for all-event forward modelling when velocity/depth parameters are updated. Use 1 for serial; use 0 for all available CPU cores capped by number of events.")
+    p.add_argument("--adapt-scale", type=float, default=2.38, help="Multiplier for empirical marginal std during scalar adaptation")
+    p.add_argument("--min-std-scale", type=float, default=0.05, help="Minimum adapted std relative to prop.dat std")
+    p.add_argument("--max-std-scale", type=float, default=20.0, help="Maximum adapted std relative to prop.dat std")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    qx_stop, qx_max_iter = resolve_qx_settings(args.qx_stop, args.qx_max_iter)
+    run_mcmc(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        iterations=args.iterations,
+        burnin=args.burnin,
+        seed=args.seed,
+        use_waves=args.use_waves,
+        qx_stop=qx_stop,
+        qx_max_iter=qx_max_iter,
+        objective_type=args.objective,
+        sigma_mode=args.sigma_mode,
+        invert_depths=args.invert_depths,
+        fix_last_layer=args.fix_last_layer,
+        fix_velocity=args.fix_velocity,
+        check_nobs_geometry=args.check_nobs_geometry,
+        check_nobs_source_geometry=args.check_nobs_source_geometry,
+        geometry_tol=args.geometry_tol,
+        adapt_start=args.adapt_start,
+        adapt_interval=args.adapt_interval,
+        adapt_stop=args.adapt_stop,
+        print_every=args.print_every,
+        dr_scale=args.dr_scale,
+        update_order=args.update_order,
+        forward_workers=args.forward_workers,
+        adapt_scale=args.adapt_scale,
+        min_std_scale=args.min_std_scale,
+        max_std_scale=args.max_std_scale,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
